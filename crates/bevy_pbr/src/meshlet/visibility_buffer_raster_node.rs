@@ -1,5 +1,6 @@
 use super::{
     pipelines::MeshletPipelines,
+    pressure::{MeshletPressure, PressureProbe, ProbeWriter},
     resource_manager::{MeshletViewBindGroups, MeshletViewResources, ResourceManager},
     MeshletSettings,
 };
@@ -39,6 +40,8 @@ pub fn meshlet_visibility_buffer_raster(
     )>,
     resource_manager: Res<ResourceManager>,
     settings: Res<MeshletSettings>,
+    pressure: Res<MeshletPressure>,
+    probe: Res<PressureProbe>,
     mut ctx: RenderContext,
 ) {
     let (
@@ -78,6 +81,12 @@ pub fn meshlet_visibility_buffer_raster(
         return;
     };
 
+    let pressure_scale = if settings.detect_queue_pressure && settings.degrade_on_queue_pressure {
+        pressure.lod_error_scale
+    } else {
+        1.0
+    };
+    let mut probe_writer = probe.begin(ctx.command_encoder(), settings.detect_queue_pressure);
     let diagnostics = ctx.diagnostic_recorder();
     let diagnostics = diagnostics.as_deref();
 
@@ -110,7 +119,8 @@ pub fn meshlet_visibility_buffer_raster(
         first_bvh_cull_pipeline,
         first_meshlet_cull_pipeline,
         remap_1d_to_2d_dispatch_pipeline,
-        1.0,
+        pressure_scale,
+        &mut probe_writer,
     );
     raster_pass(
         true,
@@ -151,7 +161,8 @@ pub fn meshlet_visibility_buffer_raster(
         second_bvh_cull_pipeline,
         second_meshlet_cull_pipeline,
         remap_1d_to_2d_dispatch_pipeline,
-        1.0,
+        pressure_scale,
+        &mut probe_writer,
     );
     raster_pass(
         false,
@@ -238,7 +249,8 @@ pub fn meshlet_visibility_buffer_raster(
             first_bvh_cull_pipeline,
             first_meshlet_cull_pipeline,
             remap_1d_to_2d_dispatch_pipeline,
-            settings.shadow_lod_error_scale,
+            settings.shadow_lod_error_scale * pressure_scale,
+            &mut probe_writer,
         );
         raster_pass(
             true,
@@ -283,7 +295,8 @@ pub fn meshlet_visibility_buffer_raster(
             second_bvh_cull_pipeline,
             second_meshlet_cull_pipeline,
             remap_1d_to_2d_dispatch_pipeline,
-            settings.shadow_lod_error_scale,
+            settings.shadow_lod_error_scale * pressure_scale,
+            &mut probe_writer,
         );
         raster_pass(
             false,
@@ -330,6 +343,8 @@ pub fn meshlet_visibility_buffer_raster(
         ctx.command_encoder().pop_debug_group();
         time_span_shadow.end(ctx.command_encoder());
     }
+
+    probe.finish(ctx.command_encoder(), &probe_writer);
 }
 
 // TODO: Replace this with vkCmdClearColorImage once wgpu supports it
@@ -366,6 +381,7 @@ fn first_cull(
     first_meshlet_cull_pipeline: &ComputePipeline,
     remap_1d_to_2d_pipeline: Option<&ComputePipeline>,
     lod_error_scale: f32,
+    probe: &mut ProbeWriter<'_>,
 ) {
     let workgroups = meshlet_view_resources.scene_instance_count.div_ceil(128);
     cull_pass(
@@ -408,6 +424,14 @@ fn first_cull(
             },
             0,
         );
+        probe.copy_bvh_level(
+            ctx.command_encoder(),
+            if ping {
+                &meshlet_view_resources.first_bvh_cull_count_front
+            } else {
+                &meshlet_view_resources.first_bvh_cull_count_back
+            },
+        );
         ctx.command_encoder().clear_buffer(
             if ping {
                 &meshlet_view_resources.first_bvh_cull_count_front
@@ -429,6 +453,13 @@ fn first_cull(
         ping = !ping;
     }
     ctx.command_encoder().pop_debug_group();
+
+    // Early + late candidate clusters share one queue: their sum is its occupancy.
+    probe.copy_pair(
+        ctx.command_encoder(),
+        &meshlet_view_resources.front_meshlet_cull_count,
+        &meshlet_view_resources.back_meshlet_cull_count,
+    );
 
     let mut pass = cull_pass(
         "meshlet_first_meshlet_cull",
@@ -461,6 +492,7 @@ fn second_cull(
     second_meshlet_cull_pipeline: &ComputePipeline,
     remap_1d_to_2d_pipeline: Option<&ComputePipeline>,
     lod_error_scale: f32,
+    _probe: &mut ProbeWriter<'_>,
 ) {
     cull_pass(
         "meshlet_second_instance_cull",

@@ -18,6 +18,7 @@ pull_requests: []
   coarser clusters (e.g. `2.0` allows 2 pixels of error), and
   `rebuild_shadow_depth_pyramid_after_second_pass` controls an extra per-shadow-view depth pyramid
   build.
+- Cull-queue overflow is detected and handled gracefully: queue occupancy is read back from the GPU (+0.05 ms measured), `MeshletPressure` exposes `peak_queue_entries`/`overflow_events`/`lod_error_scale`, and by default the LOD error budget rises when a queue overflows or nears capacity, so quality degrades instead of clusters being silently dropped (`MeshletSettings::degrade_on_queue_pressure`, `detect_queue_pressure`). A warning tells you to raise `cluster_buffer_slots`.
 - Shadow views record finer GPU spans (`first_cull_and_raster`, `hzb_after_first_pass`,
   `second_cull_and_raster`, `resolve_depth`, `hzb_final`) for `RenderDiagnosticsPlugin`.
 

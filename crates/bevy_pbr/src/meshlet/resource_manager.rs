@@ -71,6 +71,11 @@ pub struct ResourceManager {
 }
 
 impl ResourceManager {
+    /// Capacity of the cull queues, in entries (`MeshletPlugin::cluster_buffer_slots`).
+    pub fn cull_queue_slots(&self) -> u32 {
+        self.cull_queue_rightmost_slot + 1
+    }
+
     pub fn new(cluster_buffer_slots: u32, render_device: &RenderDevice) -> Self {
         let needs_dispatch_remap =
             cluster_buffer_slots > render_device.limits().max_compute_workgroups_per_dimension;
@@ -635,7 +640,7 @@ pub fn prepare_meshlet_per_frame_resources(
             render_device.create_buffer_with_data(&BufferInitDescriptor {
                 label: Some("meshlet_first_bvh_cull_count_front"),
                 contents: bytemuck::bytes_of(&0u32),
-                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
             });
         let first_bvh_cull_dispatch_front =
             render_device.create_buffer_with_data(&BufferInitDescriptor {
@@ -647,7 +652,7 @@ pub fn prepare_meshlet_per_frame_resources(
             render_device.create_buffer_with_data(&BufferInitDescriptor {
                 label: Some("meshlet_first_bvh_cull_count_back"),
                 contents: bytemuck::bytes_of(&0u32),
-                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
             });
         let first_bvh_cull_dispatch_back =
             render_device.create_buffer_with_data(&BufferInitDescriptor {
@@ -660,7 +665,7 @@ pub fn prepare_meshlet_per_frame_resources(
             render_device.create_buffer_with_data(&BufferInitDescriptor {
                 label: Some("meshlet_second_bvh_cull_count_front"),
                 contents: bytemuck::bytes_of(&0u32),
-                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
             });
         let second_bvh_cull_dispatch_front =
             render_device.create_buffer_with_data(&BufferInitDescriptor {
@@ -672,7 +677,7 @@ pub fn prepare_meshlet_per_frame_resources(
             render_device.create_buffer_with_data(&BufferInitDescriptor {
                 label: Some("meshlet_second_bvh_cull_count_back"),
                 contents: bytemuck::bytes_of(&0u32),
-                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+                usage: BufferUsages::STORAGE | BufferUsages::COPY_DST | BufferUsages::COPY_SRC,
             });
         let second_bvh_cull_dispatch_back =
             render_device.create_buffer_with_data(&BufferInitDescriptor {
@@ -685,7 +690,7 @@ pub fn prepare_meshlet_per_frame_resources(
             render_device.create_buffer_with_data(&BufferInitDescriptor {
                 label: Some("meshlet_front_meshlet_cull_count"),
                 contents: bytemuck::bytes_of(&0u32),
-                usage: BufferUsages::STORAGE,
+                usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
             });
         let front_meshlet_cull_dispatch =
             render_device.create_buffer_with_data(&BufferInitDescriptor {
@@ -697,7 +702,7 @@ pub fn prepare_meshlet_per_frame_resources(
             render_device.create_buffer_with_data(&BufferInitDescriptor {
                 label: Some("meshlet_back_meshlet_cull_count"),
                 contents: bytemuck::bytes_of(&0u32),
-                usage: BufferUsages::STORAGE,
+                usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
             });
         let back_meshlet_cull_dispatch =
             render_device.create_buffer_with_data(&BufferInitDescriptor {

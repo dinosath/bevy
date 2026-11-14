@@ -123,6 +123,15 @@ struct Args {
     /// pretend the GPU lacks 64-bit image atomics (tests the meshlet capability fallback)
     #[argh(switch)]
     disable_int64_atomics: bool,
+    /// meshlet cull queue slots (small values force overflow to test the pressure controller)
+    #[argh(option, default = "4194304")]
+    cluster_slots: u32,
+    /// disable queue pressure detection entirely
+    #[argh(switch)]
+    no_pressure_probe: bool,
+    /// disable automatic LOD degradation on queue pressure
+    #[argh(switch)]
+    no_degrade: bool,
     /// restore the extra shadow depth-pyramid rebuild after the meshlet second pass
     #[argh(switch)]
     rebuild_shadow_hzb: bool,
@@ -205,11 +214,13 @@ fn main() {
     #[cfg(feature = "meshlet")]
     if args.meshlet {
         app.add_plugins(bevy::pbr::experimental::meshlet::MeshletPlugin {
-            cluster_buffer_slots: 1 << 22,
+            cluster_buffer_slots: args.cluster_slots,
         });
         app.insert_resource(bevy::pbr::experimental::meshlet::MeshletSettings {
             rebuild_shadow_depth_pyramid_after_second_pass: args.rebuild_shadow_hzb,
             shadow_lod_error_scale: args.shadow_lod_scale,
+            degrade_on_queue_pressure: !args.no_degrade,
+            detect_queue_pressure: !args.no_pressure_probe,
         });
     }
     app.insert_resource(bevy::light::DirectionalLightShadowMap {

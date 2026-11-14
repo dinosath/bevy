@@ -10,6 +10,7 @@ mod meshlet_mesh_manager;
 mod persistent_buffer;
 mod persistent_buffer_impls;
 mod pipelines;
+mod pressure;
 mod resource_manager;
 mod visibility_buffer_raster_node;
 
@@ -28,6 +29,7 @@ pub use self::from_mesh::{
     MeshToMeshletMeshConversionError, MeshletBuildConfig,
     MESHLET_DEFAULT_VERTEX_POSITION_QUANTIZATION_FACTOR,
 };
+pub use self::pressure::{MeshletPressure, MESHLET_MAX_PRESSURE_SCALE};
 use self::{
     instance_manager::extract_meshlet_mesh_entities,
     material_pipeline_prepare::{
@@ -39,6 +41,7 @@ use self::{
     },
     meshlet_mesh_manager::perform_pending_meshlet_mesh_writes,
     pipelines::*,
+    pressure::{prepare_pressure_probe, readback_pressure, PressureProbe},
     resource_manager::{
         prepare_meshlet_per_frame_resources, prepare_meshlet_view_bind_groups, ResourceManager,
     },
@@ -99,6 +102,13 @@ pub struct MeshletSettings {
     /// `2.0` allows 2-pixel error, rendering shadows from coarser clusters. Values below `1.0`
     /// select finer shadow geometry (at a cost). Must be positive.
     pub shadow_lod_error_scale: f32,
+    /// If a cull queue overflows (or nears capacity), coarsen the LOD of all meshlet views
+    /// ([`MeshletPressure::lod_error_scale`]) instead of silently dropping geometry. Defaults to
+    /// `true`. Pressure is measured either way.
+    pub degrade_on_queue_pressure: bool,
+    /// Measure cull-queue occupancy (GPU counter copies + asynchronous readback). Defaults to
+    /// `true`. Disabling also disables `degrade_on_queue_pressure`.
+    pub detect_queue_pressure: bool,
 }
 
 impl Default for MeshletSettings {
@@ -106,6 +116,8 @@ impl Default for MeshletSettings {
         Self {
             rebuild_shadow_depth_pyramid_after_second_pass: false,
             shadow_lod_error_scale: 1.0,
+            degrade_on_queue_pressure: true,
+            detect_queue_pressure: true,
         }
     }
 }
@@ -201,6 +213,8 @@ impl Plugin for MeshletPlugin {
             move |mut commands: Commands, render_device: Res<RenderDevice>| {
                 commands
                     .insert_resource(ResourceManager::new(cluster_buffer_slots, &render_device));
+                commands.insert_resource(PressureProbe::new(&render_device));
+                commands.insert_resource(MeshletPressure::new(cluster_buffer_slots));
             };
 
         render_app
@@ -229,6 +243,8 @@ impl Plugin for MeshletPlugin {
                         .after(prepare_view_targets)
                         .in_set(RenderSystems::PrepareViews),
                     prepare_meshlet_per_frame_resources.in_set(RenderSystems::PrepareResources),
+                    prepare_pressure_probe.in_set(RenderSystems::PrepareResources),
+                    readback_pressure.in_set(RenderSystems::Cleanup),
                     prepare_meshlet_view_bind_groups.in_set(RenderSystems::PrepareBindGroups),
                     queue_material_meshlet_meshes.in_set(RenderSystems::QueueMeshes),
                     prepare_material_meshlet_meshes_main_opaque_pass
