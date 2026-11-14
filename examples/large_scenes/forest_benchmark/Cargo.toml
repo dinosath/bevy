@@ -10,6 +10,8 @@ description = "Deterministic dense-forest rendering benchmark (10k+ high-poly tr
 default = []
 # Enables the meshlet path for trunks/branches (needs a GPU supporting `MeshletPlugin::required_wgpu_features`).
 meshlet = ["bevy/meshlet", "bevy/meshlet_processor"]
+# Writes a Chrome trace (trace-*.json) with Bevy's built-in system/render spans.
+trace = ["bevy/trace_chrome"]
 
 [dependencies]
 bevy = { path = "../../../", default-features = false, features = [

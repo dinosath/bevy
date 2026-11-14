@@ -117,6 +117,9 @@ struct Args {
     /// directional shadow map resolution (per cascade)
     #[argh(option, default = "2048")]
     shadow_size: usize,
+    /// per-cascade multiplier step for meshlet shadow LOD (cascade i uses scale * step^i)
+    #[argh(option, default = "1.0")]
+    cascade_step: f32,
     /// meshlet shadow LOD error scale (1 = same as main view)
     #[argh(option, default = "1.0")]
     shadow_lod_scale: f32,
@@ -219,6 +222,7 @@ fn main() {
         app.insert_resource(bevy::pbr::experimental::meshlet::MeshletSettings {
             rebuild_shadow_depth_pyramid_after_second_pass: args.rebuild_shadow_hzb,
             shadow_lod_error_scale: args.shadow_lod_scale,
+            shadow_cascade_lod_error_scale_step: args.cascade_step,
             degrade_on_queue_pressure: !args.no_degrade,
             detect_queue_pressure: !args.no_pressure_probe,
         });
