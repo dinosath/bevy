@@ -1,0 +1,32 @@
+[package]
+name = "forest_benchmark"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT OR Apache-2.0"
+description = "Deterministic dense-forest rendering benchmark (10k+ high-poly trees) for GPU-driven rendering, LOD/HLOD and streaming work"
+
+[features]
+default = []
+# Enables the meshlet path for trunks/branches (needs a GPU supporting `MeshletPlugin::required_wgpu_features`).
+meshlet = ["bevy/meshlet", "bevy/meshlet_processor"]
+
+[dependencies]
+bevy = { path = "../../../", default-features = false, features = [
+  "default_app",
+  "3d_bevy_render",
+  "std",
+  "bevy_winit",
+  "multi_threaded",
+  "x11",
+  "default_font",
+  "bevy_dev_tools",
+  "bevy_text",
+  "bevy_ui",
+  "bevy_ui_render",
+] }
+bevy_world_streaming = { path = "../../../crates/bevy_world_streaming" }
+argh = "0.1"
+
+[lints]
+workspace = true
