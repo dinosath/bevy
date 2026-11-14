@@ -97,17 +97,17 @@ impl MeshletMeshManager {
             )
         };
 
-        // If the MeshletMesh asset has not been uploaded to the GPU yet, queue it for uploading
-        let ([_, _, _, _, bvh_node_slice, _, _], aabb, bvh_depth) = self
+        // If the MeshletMesh asset has not been uploaded to the GPU yet, queue it for uploading.
+        // Only copy the three fields we need; cloning the whole entry (seven ranges) per instance
+        // per frame showed up in profiles.
+        let (slices, aabb, bvh_depth) = self
             .meshlet_mesh_slices
             .entry(asset_id)
-            .or_insert_with_key(queue_meshlet_mesh)
-            .clone();
-
+            .or_insert_with_key(queue_meshlet_mesh);
         (
-            (bvh_node_slice.start / size_of::<BvhNode>() as u64) as u32,
-            aabb,
-            bvh_depth,
+            (slices[4].start / size_of::<BvhNode>() as u64) as u32,
+            *aabb,
+            *bvh_depth,
         )
     }
 

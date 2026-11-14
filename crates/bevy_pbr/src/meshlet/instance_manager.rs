@@ -3,7 +3,7 @@ use crate::{
     meshlet::asset::MeshletAabb, MeshFlags, MeshTransforms, MeshUniform, PreviousGlobalTransform,
     RenderMaterialInstances,
 };
-use bevy_asset::{AssetEvent, AssetServer, Assets, UntypedAssetId};
+use bevy_asset::{AssetEvent, AssetId, AssetServer, Assets, UntypedAssetId};
 use bevy_camera::visibility::RenderLayers;
 use bevy_ecs::{
     entity::{Entities, Entity, EntityHashMap},
@@ -237,6 +237,14 @@ pub fn extract_meshlet_mesh_entities(
         }
     }
 
+    // Per-frame cache of the (few) distinct MeshletMesh assets: resolving an asset costs several
+    // hash lookups, which dominated this loop when thousands of instances share one asset.
+    // `None` = asset not loaded yet (instance skipped).
+    const ASSET_CACHE_SIZE: usize = 16;
+    let mut asset_cache: [Option<(AssetId<MeshletMesh>, Option<(u32, MeshletAabb, u32)>)>;
+        ASSET_CACHE_SIZE] = [None; ASSET_CACHE_SIZE];
+    let mut asset_cache_len = 0;
+
     // Iterate over every instance
     // TODO: Switch to change events to not upload every instance every frame.
     for (
@@ -249,17 +257,34 @@ pub fn extract_meshlet_mesh_entities(
         not_shadow_caster,
     ) in &instances_query
     {
-        // Skip instances with an unloaded MeshletMesh asset
-        // TODO: This is a semi-expensive check
-        if asset_server.is_managed(meshlet_mesh.id())
-            && !asset_server.is_loaded_with_dependencies(meshlet_mesh.id())
-        {
+        let asset_id = meshlet_mesh.id();
+        let cached = asset_cache[..asset_cache_len]
+            .iter()
+            .flatten()
+            .find(|(id, _)| *id == asset_id)
+            .map(|(_, resolved)| *resolved);
+        let resolved = match cached {
+            Some(resolved) => resolved,
+            None => {
+                // Skip instances with an unloaded MeshletMesh asset
+                let resolved = if asset_server.is_managed(asset_id)
+                    && !asset_server.is_loaded_with_dependencies(asset_id)
+                {
+                    None
+                } else {
+                    // Upload the asset's MeshletMesh data if not already done
+                    Some(meshlet_mesh_manager.queue_upload_if_needed(asset_id, &mut assets))
+                };
+                if asset_cache_len < ASSET_CACHE_SIZE {
+                    asset_cache[asset_cache_len] = Some((asset_id, resolved));
+                    asset_cache_len += 1;
+                }
+                resolved
+            }
+        };
+        let Some((root_bvh_node, aabb, bvh_depth)) = resolved else {
             continue;
-        }
-
-        // Upload the instance's MeshletMesh asset data if not done already done
-        let (root_bvh_node, aabb, bvh_depth) =
-            meshlet_mesh_manager.queue_upload_if_needed(meshlet_mesh.id(), &mut assets);
+        };
 
         // Add the instance's data to the instance manager
         instance_manager.add_instance(

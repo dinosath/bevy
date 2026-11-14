@@ -99,9 +99,21 @@ pub struct MeshletSettings {
     pub rebuild_shadow_depth_pyramid_after_second_pass: bool,
     /// Multiplier on the screen-space error budget (in pixels of the *shadow map*) used for LOD
     /// selection in shadow views. `1.0` = same 1-pixel budget as the main view (default);
-    /// `2.0` allows 2-pixel error, rendering shadows from coarser clusters. Values below `1.0`
-    /// select finer shadow geometry (at a cost). Must be positive.
+    /// larger values render shadows from coarser clusters. Values below `1.0` select finer shadow
+    /// geometry (at a cost). Must be positive.
+    ///
+    /// **Quality warning:** coarse LODs drop thin geometry (branches, leaves) entirely, which
+    /// weakens or removes the shadows it casts. In `forest_benchmark`'s aerial view, the fraction
+    /// of shadowed ground retained was 97 % at `1.25`, 84 % at `1.5`, 41 % at `2.0` and 13 % at
+    /// `4.0`, for frame-time savings of ~7 %, ~16 %, ~25 % and more.
     pub shadow_lod_error_scale: f32,
+    /// Additional per-cascade multiplier for directional-light shadow cascades: cascade `i` uses
+    /// `shadow_lod_error_scale * step^i`. `1.0` (default) = all cascades equal. Far cascades cover
+    /// more world per shadow texel and are the most expensive, so e.g. `1.5` coarsens them
+    /// progressively. Must be positive. Same quality warning as `shadow_lod_error_scale`; in the
+    /// aerial benchmark a step of `1.25` retained only 80 % of shadowed ground for −13 % frame time,
+    /// i.e. no better than the uniform scale `1.5` (84 % for −16 %).
+    pub shadow_cascade_lod_error_scale_step: f32,
     /// If a cull queue overflows (or nears capacity), coarsen the LOD of all meshlet views
     /// ([`MeshletPressure::lod_error_scale`]) instead of silently dropping geometry. Defaults to
     /// `true`. Pressure is measured either way.
@@ -116,6 +128,7 @@ impl Default for MeshletSettings {
         Self {
             rebuild_shadow_depth_pyramid_after_second_pass: false,
             shadow_lod_error_scale: 1.0,
+            shadow_cascade_lod_error_scale_step: 1.0,
             degrade_on_queue_pressure: true,
             detect_queue_pressure: true,
         }

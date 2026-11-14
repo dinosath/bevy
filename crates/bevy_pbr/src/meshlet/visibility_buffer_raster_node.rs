@@ -216,6 +216,16 @@ pub fn meshlet_visibility_buffer_raster(
         meshlet_view_resources,
     ) in view_light_query.iter()
     {
+        // Far cascades cover more world per texel and tolerate more geometric error.
+        let cascade_factor = match light_type {
+            LightEntity::Directional { cascade_index, .. } => bevy_math::ops::powf(
+                settings.shadow_cascade_lod_error_scale_step,
+                *cascade_index as f32,
+            ),
+            _ => 1.0,
+        };
+        let shadow_lod_scale = settings.shadow_lod_error_scale * cascade_factor * pressure_scale;
+
         let shadow_visibility_buffer_hardware_raster_pipeline =
             if let LightEntity::Directional { .. } = light_type {
                 visibility_buffer_hardware_raster_shadow_view_unclipped_pipeline
@@ -249,7 +259,7 @@ pub fn meshlet_visibility_buffer_raster(
             first_bvh_cull_pipeline,
             first_meshlet_cull_pipeline,
             remap_1d_to_2d_dispatch_pipeline,
-            settings.shadow_lod_error_scale * pressure_scale,
+            shadow_lod_scale,
             &mut probe_writer,
         );
         raster_pass(
@@ -295,7 +305,7 @@ pub fn meshlet_visibility_buffer_raster(
             second_bvh_cull_pipeline,
             second_meshlet_cull_pipeline,
             remap_1d_to_2d_dispatch_pipeline,
-            settings.shadow_lod_error_scale * pressure_scale,
+            shadow_lod_scale,
             &mut probe_writer,
         );
         raster_pass(
