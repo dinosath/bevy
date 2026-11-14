@@ -54,7 +54,7 @@ use tracing::{error, warn};
 
 #[cfg(feature = "meshlet")]
 use crate::meshlet::{
-    prepare_material_meshlet_meshes_prepass, queue_material_meshlet_meshes, InstanceManager,
+    meshlet_supported, prepare_material_meshlet_meshes_prepass, queue_material_meshlet_meshes,
     MeshletMesh3d,
 };
 
@@ -186,7 +186,7 @@ impl Plugin for PrepassPlugin {
             prepare_material_meshlet_meshes_prepass
                 .in_set(RenderSystems::QueueMeshes)
                 .before(queue_material_meshlet_meshes)
-                .run_if(resource_exists::<InstanceManager>),
+                .run_if(meshlet_supported),
         );
     }
 }

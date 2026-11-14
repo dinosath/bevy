@@ -163,7 +163,7 @@ pub fn init_meshlet_pipelines(
         first_bvh_cull: pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
             label: Some("meshlet_first_bvh_cull_pipeline".into()),
             layout: vec![first_bvh_cull_bind_group_layout.clone()],
-            immediate_size: 8,
+            immediate_size: 12,
             shader: cull_bvh.clone(),
             shader_defs: vec![
                 "MESHLET_BVH_CULLING_PASS".into(),
@@ -175,7 +175,7 @@ pub fn init_meshlet_pipelines(
         second_bvh_cull: pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
             label: Some("meshlet_second_bvh_cull_pipeline".into()),
             layout: vec![second_bvh_cull_bind_group_layout.clone()],
-            immediate_size: 8,
+            immediate_size: 12,
             shader: cull_bvh,
             shader_defs: vec![
                 "MESHLET_BVH_CULLING_PASS".into(),
@@ -187,7 +187,7 @@ pub fn init_meshlet_pipelines(
         first_meshlet_cull: pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
             label: Some("meshlet_first_meshlet_cull_pipeline".into()),
             layout: vec![first_meshlet_cull_bind_group_layout.clone()],
-            immediate_size: 4,
+            immediate_size: 8,
             shader: cull_clusters.clone(),
             shader_defs: vec![
                 "MESHLET_CLUSTER_CULLING_PASS".into(),
@@ -199,7 +199,7 @@ pub fn init_meshlet_pipelines(
         second_meshlet_cull: pipeline_cache.queue_compute_pipeline(ComputePipelineDescriptor {
             label: Some("meshlet_second_meshlet_cull_pipeline".into()),
             layout: vec![second_meshlet_cull_bind_group_layout.clone()],
-            immediate_size: 4,
+            immediate_size: 8,
             shader: cull_clusters,
             shader_defs: vec![
                 "MESHLET_CLUSTER_CULLING_PASS".into(),

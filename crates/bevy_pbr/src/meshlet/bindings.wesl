@@ -118,7 +118,7 @@ var<immediate> constants: Constants;
 }
 
 @if(MESHLET_BVH_CULLING_PASS)
-struct Constants { read_from_front: u32, rightmost_slot: u32 }
+struct Constants { read_from_front: u32, rightmost_slot: u32, lod_error_scale: f32 }
 @if(MESHLET_BVH_CULLING_PASS) {
 var<immediate> constants: Constants;
 
@@ -155,7 +155,7 @@ var<immediate> constants: Constants;
 }
 
 @if(MESHLET_CLUSTER_CULLING_PASS)
-struct Constants { rightmost_slot: u32 }
+struct Constants { rightmost_slot: u32, lod_error_scale: f32 }
 @if(MESHLET_CLUSTER_CULLING_PASS) {
 var<immediate> constants: Constants;
 

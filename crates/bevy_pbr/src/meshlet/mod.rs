@@ -21,11 +21,12 @@ pub(crate) use self::{
 };
 
 pub use self::asset::{
-    MeshletMesh, MeshletMeshLoader, MeshletMeshSaver, MESHLET_MESH_ASSET_VERSION,
+    MeshletMesh, MeshletMeshLoader, MeshletMeshSaver, MeshletMeshStats, MESHLET_MESH_ASSET_VERSION,
 };
 #[cfg(feature = "meshlet_processor")]
 pub use self::from_mesh::{
-    MeshToMeshletMeshConversionError, MESHLET_DEFAULT_VERTEX_POSITION_QUANTIZATION_FACTOR,
+    MeshToMeshletMeshConversionError, MeshletBuildConfig,
+    MESHLET_DEFAULT_VERTEX_POSITION_QUANTIZATION_FACTOR,
 };
 use self::{
     instance_manager::extract_meshlet_mesh_entities,
@@ -58,13 +59,15 @@ use bevy_ecs::{
     component::Component,
     entity::Entity,
     query::Has,
-    reflect::ReflectComponent,
+    reflect::{ReflectComponent, ReflectResource},
+    resource::Resource,
     schedule::IntoScheduleConfigs,
     system::{Commands, Query, Res},
     template::FromTemplate,
 };
 use bevy_reflect::{std_traits::ReflectDefault, Reflect};
 use bevy_render::{
+    extract_resource::{ExtractResource, ExtractResourcePlugin},
     renderer::RenderDevice,
     settings::WgpuFeatures,
     view::{prepare_view_targets, Msaa},
@@ -74,6 +77,38 @@ use bevy_shader::load_shader_library;
 use bevy_transform::components::Transform;
 use derive_more::From;
 use tracing::error;
+
+/// Runtime tuning of the meshlet renderer. Inserted with defaults by [`MeshletPlugin`]; modify it
+/// in the main world.
+#[derive(Resource, Debug, Clone, ExtractResource, Reflect)]
+#[reflect(Resource, Debug, Default)]
+#[extract_app(RenderApp)]
+pub struct MeshletSettings {
+    /// Shadow views build their depth pyramid after the first pass (needed for the second-pass
+    /// occlusion test). If `true`, they build it **again** after the second pass so next frame's
+    /// early pass can use a pyramid that includes newly visible geometry.
+    ///
+    /// Defaults to `false`: the rebuild only makes next frame's *early* occlusion test more
+    /// effective, never more correct (a pyramid with fewer occluders can only cull less), and it
+    /// cost ~1.4 ms per shadow cascade at 2048² on the reference GPU — about 15 % of a 3-cascade
+    /// frame in `examples/large_scenes/forest_benchmark`. Set to `true` to restore the previous
+    /// behavior.
+    pub rebuild_shadow_depth_pyramid_after_second_pass: bool,
+    /// Multiplier on the screen-space error budget (in pixels of the *shadow map*) used for LOD
+    /// selection in shadow views. `1.0` = same 1-pixel budget as the main view (default);
+    /// `2.0` allows 2-pixel error, rendering shadows from coarser clusters. Values below `1.0`
+    /// select finer shadow geometry (at a cost). Must be positive.
+    pub shadow_lod_error_scale: f32,
+}
+
+impl Default for MeshletSettings {
+    fn default() -> Self {
+        Self {
+            rebuild_shadow_depth_pyramid_after_second_pass: false,
+            shadow_lod_error_scale: 1.0,
+        }
+    }
+}
 
 /// Provides a plugin for rendering large amounts of high-poly 3d meshes using an efficient GPU-driven method. See also [`MeshletMesh`].
 ///
@@ -152,7 +187,9 @@ impl Plugin for MeshletPlugin {
         embedded_asset!(app, "fill_counts.wesl");
 
         app.init_asset::<MeshletMesh>()
-            .register_asset_loader(MeshletMeshLoader);
+            .register_asset_loader(MeshletMeshLoader)
+            .init_resource::<MeshletSettings>()
+            .add_plugins(ExtractResourcePlugin::<MeshletSettings>::default());
 
         let Some(render_app) = app.get_sub_app_mut(RenderApp) else {
             return;
@@ -175,11 +212,15 @@ impl Plugin for MeshletPlugin {
                     (
                         (init_resource_manager_system, init_meshlet_pipelines).chain(),
                         init_meshlet_mesh_manager,
-                    ),
+                    )
+                        .run_if(meshlet_supported),
                 )
                     .chain(),
             )
-            .add_systems(ExtractSchedule, extract_meshlet_mesh_entities)
+            .add_systems(
+                ExtractSchedule,
+                extract_meshlet_mesh_entities.run_if(meshlet_supported),
+            )
             .add_systems(
                 Render,
                 (
@@ -193,7 +234,8 @@ impl Plugin for MeshletPlugin {
                     prepare_material_meshlet_meshes_main_opaque_pass
                         .in_set(RenderSystems::QueueMeshes)
                         .before(queue_material_meshlet_meshes),
-                ),
+                )
+                    .run_if(meshlet_supported),
             )
             .add_systems(
                 Core3d,
@@ -209,20 +251,40 @@ impl Plugin for MeshletPlugin {
                     meshlet_main_opaque_pass
                         .before(main_opaque_pass_3d)
                         .in_set(Core3dSystems::MainPass),
-                ),
+                )
+                    .run_if(meshlet_supported),
             );
     }
 }
 
-fn check_meshlet_features(render_device: Res<RenderDevice>) {
+/// Render-world resource recording whether the GPU supports [`MeshletPlugin`]
+/// (see [`MeshletPlugin::required_wgpu_features`]).
+///
+/// If it is `supported == false`, the plugin logs an error and **disables every meshlet system**:
+/// [`MeshletMesh3d`] entities are simply not rendered, and the app keeps running so it can fall
+/// back to the standard renderer (previously the process exited).
+#[derive(Resource, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeshletSupport {
+    /// `true` if the device exposes all required features.
+    pub supported: bool,
+}
+
+pub(crate) fn meshlet_supported(support: Option<Res<MeshletSupport>>) -> bool {
+    support.is_some_and(|s| s.supported)
+}
+
+fn check_meshlet_features(mut commands: Commands, render_device: Res<RenderDevice>) {
     let features = render_device.features();
-    if !features.contains(MeshletPlugin::required_wgpu_features()) {
+    let required = MeshletPlugin::required_wgpu_features();
+    let supported = features.contains(required);
+    if !supported {
         error!(
-            "MeshletPlugin can't be used. GPU lacks support for required features: {:?}.",
-            MeshletPlugin::required_wgpu_features().difference(features)
+            "MeshletPlugin disabled: GPU lacks support for required features: {:?}. \
+             `MeshletMesh3d` entities will not be rendered.",
+            required.difference(features)
         );
-        std::process::exit(1);
     }
+    commands.insert_resource(MeshletSupport { supported });
 }
 
 /// The meshlet mesh equivalent of [`bevy_mesh::Mesh3d`].

@@ -20,6 +20,19 @@ use smallvec::SmallVec;
 use thiserror::Error;
 use tracing::debug_span;
 
+/// METIS keeps global state (its random number generator is re-seeded per call but shared between
+/// threads), so concurrent partitioning calls — from the parallel group simplification below, or from
+/// several meshes being baked at once by an asset processor — interleave random draws and make the
+/// output non-deterministic. Holding this lock around every METIS call makes bakes bit-identical while
+/// the rest of the bake (meshopt simplification, meshlet building) stays parallel.
+static METIS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn metis_guard() -> std::sync::MutexGuard<'static, ()> {
+    METIS_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 // Aim to have 8 meshlets per group
 const TARGET_MESHLETS_PER_GROUP: usize = 8;
 // Reject groups that keep over 60% of their original triangles. We'd much rather render a few
@@ -32,6 +45,37 @@ const SIMPLIFICATION_FAILURE_PERCENTAGE: f32 = 0.60;
 pub const MESHLET_DEFAULT_VERTEX_POSITION_QUANTIZATION_FACTOR: u8 = 4;
 
 const CENTIMETERS_PER_METER: f32 = 100.0;
+
+/// Limits used when splitting a mesh into meshlets (clusters) with
+/// [`MeshletMesh::from_mesh_with_config`].
+///
+/// Smaller clusters cull more precisely and LOD more smoothly but increase BVH size, per-cluster
+/// metadata, and cull/raster dispatch overhead. The default (`256` vertices, `128` triangles) is
+/// what [`MeshletMesh::from_mesh`] has always used.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct MeshletBuildConfig {
+    /// Maximum vertices per meshlet. Must be in `3..=256`.
+    pub max_vertices: u32,
+    /// Maximum triangles per meshlet. Must be in `4..=128`.
+    pub max_triangles: u32,
+}
+
+impl Default for MeshletBuildConfig {
+    fn default() -> Self {
+        Self {
+            max_vertices: 256,
+            max_triangles: 128,
+        }
+    }
+}
+
+impl MeshletBuildConfig {
+    /// Triangles per METIS partition: must undershoot `max_triangles` so a partition never
+    /// exceeds it.
+    fn partition_triangles(&self) -> usize {
+        (self.max_triangles as usize).saturating_sub(2).max(1)
+    }
+}
 
 impl MeshletMesh {
     /// Process a [`Mesh`] to generate a [`MeshletMesh`].
@@ -65,6 +109,26 @@ impl MeshletMesh {
         mesh: &Mesh,
         vertex_position_quantization_factor: u8,
     ) -> Result<Self, MeshToMeshletMeshConversionError> {
+        Self::from_mesh_with_config(
+            mesh,
+            vertex_position_quantization_factor,
+            MeshletBuildConfig::default(),
+        )
+    }
+
+    /// Like [`MeshletMesh::from_mesh`], with explicit meshlet size limits.
+    ///
+    /// # Panics
+    /// Panics if `config` is outside the documented ranges.
+    pub fn from_mesh_with_config(
+        mesh: &Mesh,
+        vertex_position_quantization_factor: u8,
+        config: MeshletBuildConfig,
+    ) -> Result<Self, MeshToMeshletMeshConversionError> {
+        assert!(
+            (3..=256).contains(&config.max_vertices) && (4..=128).contains(&config.max_triangles),
+            "MeshletBuildConfig out of range: {config:?}"
+        );
         let s = debug_span!("build meshlet mesh");
         let _e = s.enter();
 
@@ -81,8 +145,13 @@ impl MeshletMesh {
         let position_only_vertex_remap = generate_position_remap(&vertices);
 
         // Split the mesh into an initial list of meshlets (LOD 0)
-        let (mut meshlets, mut cull_data) =
-            compute_meshlets(&indices, &vertices, &position_only_vertex_remap, None);
+        let (mut meshlets, mut cull_data) = compute_meshlets(
+            &indices,
+            &vertices,
+            &position_only_vertex_remap,
+            None,
+            config,
+        );
 
         let mut vertex_locks = vec![false; vertices.vertex_count];
 
@@ -156,6 +225,7 @@ impl MeshletMesh {
                     &vertices,
                     &position_only_vertex_remap,
                     Some((group.lod_bounds, group.parent_error)),
+                    config,
                 );
 
                 Ok((group, new_meshlets))
@@ -286,6 +356,7 @@ fn compute_meshlets(
     vertices: &VertexDataAdapter,
     position_only_vertex_remap: &[u32],
     prev_lod_data: Option<(BoundingSphere, f32)>,
+    config: MeshletBuildConfig,
 ) -> (Meshlets, Vec<TempMeshletCullData>) {
     // For each vertex, build a list of all triangles that use it
     let mut vertices_to_triangles = vec![Vec::new(); position_only_vertex_remap.len()];
@@ -343,13 +414,16 @@ fn compute_meshlets(
     options[metis::option::UFactor::INDEX] = 1; // Important that there's very little imbalance between partitions
 
     let mut meshlet_per_triangle = vec![0; triangle_count];
-    let partition_count = triangle_count.div_ceil(126); // Need to undershoot to prevent METIS from going over 128 triangles per meshlet
-    Graph::new(1, partition_count as i32, &xadj, &adjncy)
-        .unwrap()
-        .set_options(&options)
-        .set_adjwgt(&adjwgt)
-        .part_recursive(&mut meshlet_per_triangle)
-        .unwrap();
+    let partition_count = triangle_count.div_ceil(config.partition_triangles()); // Need to undershoot to prevent METIS from going over `max_triangles` per meshlet
+    {
+        let _metis = metis_guard();
+        Graph::new(1, partition_count as i32, &xadj, &adjncy)
+            .unwrap()
+            .set_options(&options)
+            .set_adjwgt(&adjwgt)
+            .part_recursive(&mut meshlet_per_triangle)
+            .unwrap();
+    }
 
     let mut indices_per_meshlet = vec![Vec::new(); partition_count];
     for (triangle_id, meshlet) in meshlet_per_triangle.into_iter().enumerate() {
@@ -372,7 +446,13 @@ fn compute_meshlets(
         )
     };
     for meshlet_indices in &indices_per_meshlet {
-        let meshlet = build_meshlets(meshlet_indices, vertices, 256, 128, 0.0);
+        let meshlet = build_meshlets(
+            meshlet_indices,
+            vertices,
+            config.max_vertices as usize,
+            config.max_triangles as usize,
+            0.0,
+        );
         for meshlet in meshlet.iter() {
             let (lod_group_sphere, error) = prev_lod_data.unwrap_or_else(|| {
                 let bounds = meshopt::compute_meshlet_bounds(meshlet, vertices);
@@ -468,12 +548,15 @@ fn group_meshlets(
     let partition_count = simplification_queue
         .len()
         .div_ceil(TARGET_MESHLETS_PER_GROUP); // TODO: Nanite uses groups of 8-32, probably based on some kind of heuristic
-    Graph::new(1, partition_count as i32, &xadj, &adjncy)
-        .unwrap()
-        .set_options(&options)
-        .set_adjwgt(&adjwgt)
-        .part_recursive(&mut group_per_meshlet)
-        .unwrap();
+    {
+        let _metis = metis_guard();
+        Graph::new(1, partition_count as i32, &xadj, &adjncy)
+            .unwrap()
+            .set_options(&options)
+            .set_adjwgt(&adjwgt)
+            .part_recursive(&mut group_per_meshlet)
+            .unwrap();
+    }
 
     let mut groups = vec![TempMeshletGroup::default(); partition_count];
     for (i, meshlet_group) in group_per_meshlet.into_iter().enumerate() {
@@ -1096,4 +1179,116 @@ pub enum MeshToMeshletMeshConversionError {
     },
     #[error("Mesh has no indices")]
     MeshMissingIndices,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bevy_mesh::{Mesh, MeshBuilder, SphereMeshBuilder};
+
+    fn sphere() -> Mesh {
+        AsyncComputeTaskPool::get_or_init(|| {
+            match std::env::var("MESHLET_TEST_THREADS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+            {
+                Some(n) => bevy_tasks::TaskPoolBuilder::new().num_threads(n).build(),
+                None => bevy_tasks::TaskPool::default(),
+            }
+        });
+        SphereMeshBuilder::new(
+            1.0,
+            bevy_mesh::SphereKind::Uv {
+                sectors: 64,
+                stacks: 32,
+            },
+        )
+        .build()
+    }
+
+    #[test]
+    fn config_limits_are_respected_and_stats_are_consistent() {
+        let mesh = sphere();
+        let mut meshlet_counts = Vec::new();
+        for max_triangles in [32u32, 64, 128] {
+            let cfg = MeshletBuildConfig {
+                max_vertices: 256,
+                max_triangles,
+            };
+            let m = MeshletMesh::from_mesh_with_config(&mesh, 4, cfg).unwrap();
+            assert!(
+                m.meshlets
+                    .iter()
+                    .all(|x| u32::from(x.triangle_count) <= max_triangles),
+                "meshlet exceeded {max_triangles} triangles"
+            );
+            let s = m.stats();
+            assert_eq!(s.meshlets as usize, m.meshlets.len());
+            assert_eq!(
+                s.triangles,
+                m.meshlets
+                    .iter()
+                    .map(|x| u64::from(x.triangle_count))
+                    .sum::<u64>()
+            );
+            assert!(s.bvh_nodes > 0 && s.bvh_depth > 0);
+            assert!(s.lz4_file_bytes > 0 && s.lz4_file_bytes < s.total_bytes());
+            assert_eq!(
+                s.total_bytes(),
+                s.position_bytes
+                    + s.normal_bytes
+                    + s.uv_bytes
+                    + s.index_bytes
+                    + s.bvh_bytes
+                    + s.meshlet_descriptor_bytes
+                    + s.cull_data_bytes
+            );
+            meshlet_counts.push(s.meshlets);
+        }
+        // Smaller clusters ⇒ more meshlets.
+        assert!(meshlet_counts[0] > meshlet_counts[1] && meshlet_counts[1] > meshlet_counts[2]);
+    }
+
+    #[test]
+    #[should_panic(expected = "out of range")]
+    fn invalid_config_panics() {
+        let _ = MeshletMesh::from_mesh_with_config(
+            &sphere(),
+            4,
+            MeshletBuildConfig {
+                max_vertices: 256,
+                max_triangles: 500,
+            },
+        );
+    }
+
+    /// `from_mesh` is `from_mesh_with_config(default)` and bakes are deterministic, so the results
+    /// must match exactly.
+    #[test]
+    fn default_config_matches_from_mesh() {
+        let mesh = sphere();
+        let a = MeshletMesh::from_mesh(&mesh, 4).unwrap();
+        let b =
+            MeshletMesh::from_mesh_with_config(&mesh, 4, MeshletBuildConfig::default()).unwrap();
+        assert!(a.meshlets.iter().all(|x| x.triangle_count <= 128));
+        assert_eq!(a.stats(), b.stats());
+    }
+
+    /// Two bakes of the same mesh with the same settings must be bit-identical (content-addressed
+    /// asset caches rely on this).
+    #[test]
+    fn bakes_are_bit_identical() {
+        let mesh = sphere();
+        let a = MeshletMesh::from_mesh(&mesh, 4).unwrap();
+        for _ in 0..4 {
+            let b = MeshletMesh::from_mesh(&mesh, 4).unwrap();
+            assert_eq!(a.stats(), b.stats(), "stats differ between identical bakes");
+            assert_eq!(&*a.vertex_positions, &*b.vertex_positions);
+            assert_eq!(&*a.indices, &*b.indices);
+            assert_eq!(
+                bytemuck::cast_slice::<_, u8>(&a.meshlets),
+                bytemuck::cast_slice::<_, u8>(&b.meshlets)
+            );
+        }
+    }
 }

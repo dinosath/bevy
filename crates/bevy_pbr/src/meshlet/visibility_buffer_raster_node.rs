@@ -1,6 +1,7 @@
 use super::{
     pipelines::MeshletPipelines,
     resource_manager::{MeshletViewBindGroups, MeshletViewResources, ResourceManager},
+    MeshletSettings,
 };
 use crate::{LightEntity, ShadowView};
 use bevy_color::LinearRgba;
@@ -37,6 +38,7 @@ pub fn meshlet_visibility_buffer_raster(
         &MeshletViewResources,
     )>,
     resource_manager: Res<ResourceManager>,
+    settings: Res<MeshletSettings>,
     mut ctx: RenderContext,
 ) {
     let (
@@ -108,6 +110,7 @@ pub fn meshlet_visibility_buffer_raster(
         first_bvh_cull_pipeline,
         first_meshlet_cull_pipeline,
         remap_1d_to_2d_dispatch_pipeline,
+        1.0,
     );
     raster_pass(
         true,
@@ -148,6 +151,7 @@ pub fn meshlet_visibility_buffer_raster(
         second_bvh_cull_pipeline,
         second_meshlet_cull_pipeline,
         remap_1d_to_2d_dispatch_pipeline,
+        1.0,
     );
     raster_pass(
         false,
@@ -223,6 +227,7 @@ pub fn meshlet_visibility_buffer_raster(
         );
 
         ctx.command_encoder().push_debug_group("meshlet_first_pass");
+        let span = diagnostics.time_span(ctx.command_encoder(), "first_cull_and_raster");
         first_cull(
             &mut ctx,
             meshlet_view_bind_groups,
@@ -233,6 +238,7 @@ pub fn meshlet_visibility_buffer_raster(
             first_bvh_cull_pipeline,
             first_meshlet_cull_pipeline,
             remap_1d_to_2d_dispatch_pipeline,
+            settings.shadow_lod_error_scale,
         );
         raster_pass(
             true,
@@ -248,8 +254,10 @@ pub fn meshlet_visibility_buffer_raster(
             None,
             meshlet_view_resources.rightmost_slot,
         );
+        span.end(ctx.command_encoder());
         ctx.command_encoder().pop_debug_group();
 
+        let span = diagnostics.time_span(ctx.command_encoder(), "hzb_after_first_pass");
         meshlet_view_resources
             .depth_pyramid
             .downsample_depth_with_ctx(
@@ -260,9 +268,11 @@ pub fn meshlet_visibility_buffer_raster(
                 downsample_depth_first_shadow_view_pipeline,
                 downsample_depth_second_shadow_view_pipeline,
             );
+        span.end(ctx.command_encoder());
 
         ctx.command_encoder()
             .push_debug_group("meshlet_second_pass");
+        let span = diagnostics.time_span(ctx.command_encoder(), "second_cull_and_raster");
         second_cull(
             &mut ctx,
             meshlet_view_bind_groups,
@@ -273,6 +283,7 @@ pub fn meshlet_visibility_buffer_raster(
             second_bvh_cull_pipeline,
             second_meshlet_cull_pipeline,
             remap_1d_to_2d_dispatch_pipeline,
+            settings.shadow_lod_error_scale,
         );
         raster_pass(
             false,
@@ -288,8 +299,10 @@ pub fn meshlet_visibility_buffer_raster(
             None,
             meshlet_view_resources.rightmost_slot,
         );
+        span.end(ctx.command_encoder());
         ctx.command_encoder().pop_debug_group();
 
+        let span = diagnostics.time_span(ctx.command_encoder(), "resolve_depth");
         resolve_depth(
             &mut ctx,
             shadow_view.depth_attachment.get_attachment(StoreOp::Store),
@@ -297,16 +310,23 @@ pub fn meshlet_visibility_buffer_raster(
             resolve_depth_shadow_view_pipeline,
             camera,
         );
-        meshlet_view_resources
-            .depth_pyramid
-            .downsample_depth_with_ctx(
-                "downsample_depth",
-                &mut ctx,
-                meshlet_view_resources.view_size,
-                &meshlet_view_bind_groups.downsample_depth,
-                downsample_depth_first_shadow_view_pipeline,
-                downsample_depth_second_shadow_view_pipeline,
-            );
+        span.end(ctx.command_encoder());
+        // Rebuilding the pyramid here only refines next frame's early-pass test (see
+        // `MeshletSettings::rebuild_shadow_depth_pyramid_after_second_pass`).
+        if settings.rebuild_shadow_depth_pyramid_after_second_pass {
+            let span = diagnostics.time_span(ctx.command_encoder(), "hzb_final");
+            meshlet_view_resources
+                .depth_pyramid
+                .downsample_depth_with_ctx(
+                    "downsample_depth",
+                    &mut ctx,
+                    meshlet_view_resources.view_size,
+                    &meshlet_view_bind_groups.downsample_depth,
+                    downsample_depth_first_shadow_view_pipeline,
+                    downsample_depth_second_shadow_view_pipeline,
+                );
+            span.end(ctx.command_encoder());
+        }
         ctx.command_encoder().pop_debug_group();
         time_span_shadow.end(ctx.command_encoder());
     }
@@ -345,6 +365,7 @@ fn first_cull(
     first_bvh_cull_pipeline: &ComputePipeline,
     first_meshlet_cull_pipeline: &ComputePipeline,
     remap_1d_to_2d_pipeline: Option<&ComputePipeline>,
+    lod_error_scale: f32,
 ) {
     let workgroups = meshlet_view_resources.scene_instance_count.div_ceil(128);
     cull_pass(
@@ -373,7 +394,11 @@ fn first_cull(
             view_offset,
             previous_view_offset,
             first_bvh_cull_pipeline,
-            &[ping as u32, meshlet_view_resources.rightmost_slot],
+            &[
+                ping as u32,
+                meshlet_view_resources.rightmost_slot,
+                lod_error_scale.to_bits(),
+            ],
         )
         .dispatch_workgroups_indirect(
             if ping {
@@ -412,7 +437,10 @@ fn first_cull(
         view_offset,
         previous_view_offset,
         first_meshlet_cull_pipeline,
-        &[meshlet_view_resources.rightmost_slot],
+        &[
+            meshlet_view_resources.rightmost_slot,
+            lod_error_scale.to_bits(),
+        ],
     );
     pass.dispatch_workgroups_indirect(&meshlet_view_resources.front_meshlet_cull_dispatch, 0);
     remap_1d_to_2d(
@@ -432,6 +460,7 @@ fn second_cull(
     second_bvh_cull_pipeline: &ComputePipeline,
     second_meshlet_cull_pipeline: &ComputePipeline,
     remap_1d_to_2d_pipeline: Option<&ComputePipeline>,
+    lod_error_scale: f32,
 ) {
     cull_pass(
         "meshlet_second_instance_cull",
@@ -459,7 +488,11 @@ fn second_cull(
             view_offset,
             previous_view_offset,
             second_bvh_cull_pipeline,
-            &[ping as u32, meshlet_view_resources.rightmost_slot],
+            &[
+                ping as u32,
+                meshlet_view_resources.rightmost_slot,
+                lod_error_scale.to_bits(),
+            ],
         )
         .dispatch_workgroups_indirect(
             if ping {
@@ -480,7 +513,10 @@ fn second_cull(
         view_offset,
         previous_view_offset,
         second_meshlet_cull_pipeline,
-        &[meshlet_view_resources.rightmost_slot],
+        &[
+            meshlet_view_resources.rightmost_slot,
+            lod_error_scale.to_bits(),
+        ],
     );
     pass.dispatch_workgroups_indirect(&meshlet_view_resources.back_meshlet_cull_dispatch, 0);
     remap_1d_to_2d(

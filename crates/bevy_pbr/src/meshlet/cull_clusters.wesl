@@ -41,7 +41,7 @@ fn cull_clusters(@builtin(global_invocation_id) global_invocation_id: vec3<u32>)
     let error = get_aabb_error(&aabb_error_offset);
     let lod_sphere = (*cull_data).lod_group_sphere;
 
-    let is_imperceptible = lod_error_is_imperceptible(lod_sphere, error, instance_id);
+    let is_imperceptible = lod_error_is_imperceptible(lod_sphere, error, instance_id, constants.lod_error_scale);
     // Error and frustum cull, in both passes
     if !is_imperceptible || !aabb_in_frustum(aabb, instance_id) { return; }
 

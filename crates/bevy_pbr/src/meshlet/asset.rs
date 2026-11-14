@@ -60,6 +60,106 @@ pub struct MeshletMesh {
     pub(crate) bvh_depth: u32,
 }
 
+/// Size and structure statistics of a [`MeshletMesh`], for tooling, budgeting and benchmarks.
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub struct MeshletMeshStats {
+    /// Total meshlets across all LOD levels.
+    pub meshlets: u32,
+    /// Triangles summed over all meshlets (all LODs).
+    pub triangles: u64,
+    /// Vertices summed over all meshlets (all LODs; shared vertices counted per meshlet).
+    pub meshlet_vertices: u64,
+    /// BVH8 node count.
+    pub bvh_nodes: u32,
+    /// BVH depth (number of cull dispatches needed at runtime).
+    pub bvh_depth: u32,
+    /// Bytes of bit-packed vertex positions.
+    pub position_bytes: u64,
+    /// Bytes of packed normals.
+    pub normal_bytes: u64,
+    /// Bytes of UVs.
+    pub uv_bytes: u64,
+    /// Bytes of triangle indices.
+    pub index_bytes: u64,
+    /// Bytes of BVH nodes.
+    pub bvh_bytes: u64,
+    /// Bytes of meshlet descriptors.
+    pub meshlet_descriptor_bytes: u64,
+    /// Bytes of per-meshlet cull data.
+    pub cull_data_bytes: u64,
+    /// Size of the `.meshlet_mesh` file payload after lz4 frame compression (what
+    /// [`MeshletMeshSaver`] writes, header excluded).
+    pub lz4_file_bytes: u64,
+}
+
+impl MeshletMeshStats {
+    /// Total uncompressed (in-memory / on-GPU) bytes.
+    pub fn total_bytes(&self) -> u64 {
+        self.position_bytes
+            + self.normal_bytes
+            + self.uv_bytes
+            + self.index_bytes
+            + self.bvh_bytes
+            + self.meshlet_descriptor_bytes
+            + self.cull_data_bytes
+    }
+}
+
+impl MeshletMesh {
+    /// Size and structure statistics (see [`MeshletMeshStats`]).
+    pub fn stats(&self) -> MeshletMeshStats {
+        MeshletMeshStats {
+            meshlets: self.meshlets.len() as u32,
+            triangles: self
+                .meshlets
+                .iter()
+                .map(|m| u64::from(m.triangle_count))
+                .sum(),
+            meshlet_vertices: self
+                .meshlets
+                .iter()
+                .map(|m| u64::from(m.vertex_count_minus_one) + 1)
+                .sum(),
+            bvh_nodes: self.bvh.len() as u32,
+            bvh_depth: self.bvh_depth,
+            position_bytes: size_of_val(&*self.vertex_positions) as u64,
+            normal_bytes: size_of_val(&*self.vertex_normals) as u64,
+            uv_bytes: size_of_val(&*self.vertex_uvs) as u64,
+            index_bytes: size_of_val(&*self.indices) as u64,
+            bvh_bytes: size_of_val(&*self.bvh) as u64,
+            meshlet_descriptor_bytes: size_of_val(&*self.meshlets) as u64,
+            cull_data_bytes: size_of_val(&*self.meshlet_cull_data) as u64,
+            lz4_file_bytes: self.lz4_size(),
+        }
+    }
+
+    /// Compressed payload size, computed with the same layout as [`MeshletMeshSaver`].
+    fn lz4_size(&self) -> u64 {
+        struct Counter(u64);
+        impl Write for Counter {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0 += buf.len() as u64;
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut w = FrameEncoder::new(Counter(0));
+        let ok = write_slice(&self.vertex_positions, &mut w).is_ok()
+            && write_slice(&self.vertex_normals, &mut w).is_ok()
+            && write_slice(&self.vertex_uvs, &mut w).is_ok()
+            && write_slice(&self.indices, &mut w).is_ok()
+            && write_slice(&self.bvh, &mut w).is_ok()
+            && write_slice(&self.meshlets, &mut w).is_ok()
+            && write_slice(&self.meshlet_cull_data, &mut w).is_ok();
+        match (ok, w.finish()) {
+            (true, Ok(c)) => c.0,
+            _ => 0,
+        }
+    }
+}
+
 /// A single BVH8 node in the BVH used for culling and LOD selection of a [`MeshletMesh`].
 #[derive(Copy, Clone, Default, Pod, Zeroable)]
 #[repr(C)]

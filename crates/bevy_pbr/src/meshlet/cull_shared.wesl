@@ -10,7 +10,9 @@ import package::meshlet::bindings::{
 import bevy_render::maths::affine3_to_square;
 
 /// https://github.com/zeux/meshoptimizer/blob/1e48e96c7e8059321de492865165e9ef071bffba/demo/nanite.cpp#L115
-fn lod_error_is_imperceptible(lod_sphere: vec4<f32>, simplification_error: f32, instance_id: u32) -> bool {
+/// `error_scale` multiplies the allowed screen-space error budget (1.0 = 1 pixel; 2.0 = 2 pixels), used to
+/// render shadow views at a coarser LOD than the main view.
+fn lod_error_is_imperceptible(lod_sphere: vec4<f32>, simplification_error: f32, instance_id: u32, error_scale: f32) -> bool {
     let world_from_local = affine3_to_square(meshlet_instance_uniforms[instance_id].world_from_local);
     let world_scale = max(length(world_from_local[0]), max(length(world_from_local[1]), length(world_from_local[2])));
     let camera_pos = view.world_position;
@@ -22,7 +24,7 @@ fn lod_error_is_imperceptible(lod_sphere: vec4<f32>, simplification_error: f32, 
         let proj = projection[1][1];
         let height = 2.0 / proj;
         let norm_error = world_error / height;
-        return norm_error * view.viewport.w < 1.0;
+        return norm_error * view.viewport.w < error_scale;
     } else {
         // Perspective
         var near = projection[3][2];
@@ -30,8 +32,9 @@ fn lod_error_is_imperceptible(lod_sphere: vec4<f32>, simplification_error: f32, 
         let world_sphere_radius = lod_sphere.w * world_scale;
         let d_pos = world_sphere_center - camera_pos;
         let d = sqrt(dot(d_pos, d_pos)) - world_sphere_radius;
-        let norm_error = simplification_error / max(d, near) * projection[1][1] * 0.5;
-        return norm_error * view.viewport.w < 1.0;
+        // The simplification error is in local space, like in the orthographic branch.
+        let norm_error = simplification_error * world_scale / max(d, near) * projection[1][1] * 0.5;
+        return norm_error * view.viewport.w < error_scale;
     }
 }
 
