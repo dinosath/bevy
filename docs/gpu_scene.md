@@ -22,6 +22,18 @@ One retained table set, owned by a `GpuScenePlugin`, consumed by main view, shad
 
 Rules: (1) CPU never iterates all instances per frame — extraction is **change-driven** (`Added/Changed<GlobalTransform>`, removals); (2) the `class` bits are the hook for the simple/complex split (matrix #5) — introduced **only when a second class exists**; (3) previous-transform stored GPU-side (temporal passes, motion vectors, VSM invalidation “moved this frame”); (4) one table feeds every view type.
 
+## Measured evidence (Phase 2) [Bench] — details in `performance.md` §10
+* Meshlet scenes become **CPU-bound at ≈12 k instances**; non-GPU gap ≈ 0.115 ms per 1 000 instances (100 k: 57 % of the frame; 200 k: 65 %, with the GPU doing a 4.68 B-triangle scene in 12.5 ms).
+* Per frame at 100 k: `extract_meshlet_mesh_entities` 7.0 ms (serial, blocks main), `prepare_meshlet_per_frame_resources` 4.5, `queue_material_meshlet_meshes` 1.3, `prepare_material_meshlet_meshes_*` 1.2.
+* Contained fixes: asset cache + no per-instance tuple clone in the extractor −1.26 ms (−18 %, kept); view-visibility loop tweaks no gain; `NoCpuCulling` no effect.
+
+## Design constraint discovered while trying a static fast path [Bevy]
+"Skip all work when nothing changed" **does not work** for any scene with a moving camera:
+1. `RenderMaterialInstances` is mutated through `ResMut` every frame (`current_change_tick` bump), so `is_changed()` carries no information.
+2. `extract_mesh_materials` registers an entity's material only when its `ViewVisibility` is `true` (and re-runs it on `Changed<ViewVisibility>`), so CPU frustum culling continually inserts/removes meshlet instances' material entries as the camera moves.
+3. `queue_material_meshlet_meshes` and `prepare_material_meshlet_meshes_*` then rebuild per-frame material ids from that table.
+Therefore a *correct* retained scene must (a) hold instance rows in stable slots with a free list, driven by `Added/Changed/Removed` on `MeshletMesh3d`, `GlobalTransform`, `PreviousGlobalTransform`, `RenderLayers`, `NotShadowCaster/Receiver` and `AssetEvent<MeshletMesh>`; (b) **decouple meshlet material registration from `ViewVisibility`** (meshlets are GPU-culled; CPU visibility is irrelevant to them) and key material ids by material asset rather than rebuilding them per frame; (c) upload dirty slot ranges only (the existing `SparseBufferVec` scatter, `bevy-gpu` skill), including a per-view bit-vector that is rebuilt only when layers/shadow flags change. Estimated ceiling: removes ≈ 11–13 of the ≈14 ms CPU path at 100 k instances (frame ≈ 9 ms, then GPU-bound) — **an estimate from the span breakdown, not a measured result**; it is the largest remaining item for large instance counts.
+
 ## Expected benefit / risk
 Removes O(instances) CPU extract+upload for static scenes (forests, cities): **[Assumption]** the meshlet path's CPU cost at 12 k instances is not currently the bottleneck (frame was 5.4 ms with no shadows), so the payoff appears at ≥10⁵–10⁶ instances. First step is a **benchmark at 100 k/500 k instances** to find where CPU `extract_meshlet_mesh_entities` crosses the GPU time — not done yet.
 

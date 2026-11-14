@@ -85,9 +85,11 @@ Interleaved 4-run comparison, current binary (mean frame ms; min–max across ru
 |---|---:|---:|---:|---:|---:|
 | old behavior (`--rebuild-shadow-hzb`) | 29.68 (29.36–29.86) | 29.04 | 33.16 | 43.65 | — |
 | **new default** (skip extra rebuild) | **24.98** (24.79–25.20) | 24.33 | 28.50 | 38.88 | **−15.8 %** |
-| new default + `shadow_lod_error_scale = 2` | **18.78** (18.28–19.98) | 18.10 | 22.78 | 33.55 | **−36.7 %** |
+| new default + `shadow_lod_error_scale = 2` | **18.78** (18.28–19.98) | 18.10 | 22.78 | 33.55 | −36.7 % — **but see §11: retains only 41 % of far shadows** |
 
 (An earlier 6-pair run of change 1 alone gave −11 % on the pre-LOD-plumbing binary; the 4-run figure above is the cleaner measurement.) Earlier sweep: scale 4 ≈ 20.7 ms, i.e. diminishing returns past 2 because the fixed per-view costs remain.
+
+**⚠ CORRECTION (see §11): the quality check below only covered a *near* view and the `shadow_lod_error_scale = 2` figure above is not a free win — in an aerial view scale 2 retains only 41 % of shadowed ground.**
 
 **Correctness/quality checks.** (a) Rendered images: this renderer is not pixel-reproducible on this GPU even in a *static* scene (two identical runs differ in ~15.7 k of 921 k pixels — consistent with the open software-raster flicker issue #26467); A-vs-B differences (15.6–15.8 k px) are indistinguishable from that noise, so no regression from change 1 is detectable; by construction the drawn set stays conservative. (b) Visual: the same frame at scale 1 vs 4 shows near-identical tree shadows (single view, single frame; not a quality study) — hence the default stays at 1.0 and the knob is documented as a quality/speed trade-off. (c) Capability fallback verified on hardware (see below).
 
@@ -111,13 +113,55 @@ Quality cost of degrading is real: the scale applies to the main view too, so ne
 **Limits**: second-pass BVH levels are not sampled (their counters are cumulative, not cleared per level) — the first-pass early+late pair already includes the late entries; BVH-level queue occupancy is sampled only in the first pass; with several cameras only the first raster-node invocation per frame is probed.
 **Measurement lesson (again)**: a first non-interleaved run suggested the probe cost +2 ms (27.07 vs 24.98); the interleaved A/B showed +0.05 ms — the difference was machine drift. Only interleaved comparisons are trusted in this document.
 
-## 10. Reproduce
+## 10. Instance scaling and the CPU path (Phase 2 evidence) — **[Bench]**
+
+`forest_benchmark --meshlet --no-shadows --trees N` (opaque 23 k-tri trees, drive path). Scene size reaches **4.68 billion LOD0 triangles** at 200 k instances.
+
+| Instances | frame ms (mean / P99) | GPU: `meshlet_visibility_buffer_raster` | other GPU spans | non-GPU gap |
+|---:|---|---:|---:|---:|
+| 12 k | 6.37 / 9.97 | 3.57 | ~0.9 | ~1.9 |
+| 50 k | 12.13 / 14.39 | 5.34 | ~1.0 | ~5.8 |
+| 100 k | 20.28 / 23.42 | 7.67 | ~1.0 | ~11.6 |
+| 200 k | 35.46 / 41.67 | 11.43 | ~1.0 | ~23 |
+
+GPU time grows gently (it tracks *visible* clusters); the frame is **CPU-bound from ≈12 k instances up**, with a gap of ≈0.115 ms per 1 000 instances (57 % of the frame at 100 k, 65 % at 200 k).
+
+Per-frame system cost at **100 k instances** (Bevy `trace_chrome`, `--features trace`): `extract_meshlet_mesh_entities` **7.04 ms** (serial, blocks the main world), `prepare_meshlet_per_frame_resources` **4.55**, `queue_material_meshlet_meshes` 1.27, `prepare_material_meshlet_meshes_main_opaque_pass` 1.19, `check_visibility_cpu_culling` 1.73 — ≈ 14 ms, matching the gap. Root causes read from source: per instance per frame the extractor does several hash lookups (`is_managed`, `is_loaded_with_dependencies`, `queue_upload_if_needed` which also *cloned a ~150-byte tuple*, material and binding lookups) and rebuilds/uploads four whole `StorageBuffer<Vec<_>>`s plus one visibility bit-vector per view.
+
+Contained optimizations tried (interleaved old/new binaries, 3 pairs each):
+* **Per-frame asset cache + no tuple clone in the extractor: extract 7.07 → 5.81 ms (−1.26 ms, −18 %)** — consistent in both rounds. Kept.
+* Hoisting `RenderLayers::default()` / pre-sizing / memoizing the per-view visibility loop in `prepare`: **no gain, `prepare` +0.3 ms in every pair** (equality on `RenderLayers` costs more than the `intersects` it avoids). Reverted.
+* `NoCpuCulling` on the camera: frame 19.07 vs 19.06 ms, the CPU culling system still ran at 1.65 ms. **No effect on meshlet scenes.**
+
+Conclusion: contained fixes address ≈ 9 % of the CPU path; **the remaining ≈ 13 ms at 100 k needs the retained GPU scene**. A *static fast path* ("skip everything if nothing changed") was investigated and rejected: `RenderMaterialInstances.current_change_tick` is bumped every frame (so `is_changed()` is useless) and materials are registered only for entities whose `ViewVisibility` is true, so a moving camera continually flips instances in and out of the table — any scene with a moving camera is "dirty". A correct retained design must make material registration incremental too (see `gpu_scene.md`).
+
+## 11. Shadow LOD: speed vs. shadow retention — **[Bench]**
+
+Metric: fraction of ground pixels that are shadowed in an **aerial** frame (150 m up; far cascades dominate), relative to the default (3.17 %); tool: `forest_benchmark/tools/shadow_coverage.py`. Frame time: 3 interleaved drive-path runs per config (mean frame ms vs the base in the same loop).
+
+| Setting | frame vs base | shadowed ground retained |
+|---|---:|---:|
+| base (scale 1, step 1) | 25.19 ms | 100 % |
+| uniform scale 1.25 | −6.6 % | 97 % (3.06 %) |
+| **uniform scale 1.5** | **−15.5 %** | **84 %** (2.66 %) |
+| per-cascade step 1.1 | −3.6 % | 97 % |
+| per-cascade step 1.25 | −13.1 % | 80 % |
+| per-cascade step 1.5 | −28.3 % (far cascade 10.1 → 3.6 ms) | 26 % (0.82 %) |
+| uniform scale 2 | ≈ −25 % | 41 % (1.31 %) |
+| per-cascade step 2 | −30.5 % | 13 % (0.41 %) |
+| uniform scale 4 | — | 13 % (0.41 %) |
+
+**Findings.** (1) Speed bought by coarse shadow LOD is bought with *missing shadows*: thin branches/leaves simplify away entirely (the Preserve-Area problem, `foliage.md`). (2) The earlier single-view check ("scale 4 looks near-identical", near camera) was misleading — near cascades are fine-grained; the aerial view exposes the loss. (3) In this view, **uniform scaling dominates per-cascade stepping** (1.5 uniform: −15.5 % at 84 % vs step 1.25: −13.1 % at 80 %), so the new `shadow_cascade_lod_error_scale_step` is shipped but **not recommended**; both defaults stay `1.0`. (4) The proper fix is not a scale but keeping thin geometry in coarse clusters (area-preserving simplification) or page-based shadows. Caveats: one scene, one aerial frame, one threshold; the metric counts dark ground pixels, not shadow shape fidelity.
+
+## 12. Reproduce
 
 ```bash
 cargo run --release -p forest_benchmark --features meshlet -- --meshlet --meshlet-tris 64 --no-shadows --label t64
 cargo run --release -p forest_benchmark --features meshlet -- --meshlet --cascades 1 --label c1
 cargo test -p bevy_pbr --features meshlet_processor --lib meshlet
-cargo run --release -p forest_benchmark --features meshlet -- --meshlet --shadow-lod-scale 2 --top-spans 40
+cargo run --release -p forest_benchmark --features meshlet -- --meshlet --shadow-lod-scale 1.5 --top-spans 40
+cargo run --release -p forest_benchmark --features meshlet -- --meshlet --path aerial --shadow-lod-scale 1.5 --screenshot-frame 60 --screenshot-path a.png   # then tools/shadow_coverage.py
+cargo run --release -p forest_benchmark --features meshlet,trace -- --meshlet --no-shadows --trees 100000   # trace-*.json, summarize with tools/trace_summary.py
 cargo run --release -p forest_benchmark --features meshlet -- --meshlet --rebuild-shadow-hzb   # old behaviour
 cargo run --release -p forest_benchmark --features meshlet -- --meshlet --disable-int64-atomics # fallback test
 RUST_LOG=bevy_pbr::meshlet=debug cargo run --release -p forest_benchmark --features meshlet -- --meshlet --cluster-slots 32768   # forced overflow; add --no-degrade / --no-pressure-probe to compare
