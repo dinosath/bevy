@@ -16,7 +16,11 @@ Pass structure per view (`visibility_buffer_raster_node.rs`): `clear_visibility_
 | Simple/complex split | meshlets are rigid-static only | defer until skinned/spline/assembly instances exist |
 | Cone culling | meshlet build computes the cone then discards it | add behind asset v4 (`cluster_hierarchy.md`); correctness test vs brute force |
 
-## Overflow & pressure policy (Part 44) [Proposal — **detection not implemented; the degrade lever now exists**]
+## Overflow & pressure policy (Part 44) — **IMPLEMENTED for the meshlet cull queues** (`meshlet/pressure.rs`; results in `performance.md` §9)
+
+The text below is the original design; what shipped differs in one respect: instead of a shader-side `atomicOr` flag it uses **GPU-side counter copies** into a probe buffer (no shader or bind-group changes), sampled for first-pass BVH levels and the early+late cluster pair; the policy constants are in `MeshletPressure::observe`. Not covered: second-pass BVH levels, SW-raster/visible-cluster buffers, and the non-queue pressure sources (streaming, shadow pages, RT), which remain design-only.
+
+### Original design
 Today: silent. The LOD error budget is now a per-dispatch immediate (`constants.lod_error_scale`, `cull_shared.wesl::lod_error_is_imperceptible(…, error_scale)`), exposed for shadow views as `MeshletSettings::shadow_lod_error_scale`; step 2 below only needs a *detector* and a per-view scale source. Design:
 1. **Detect**: a 4-byte `overflow_flags` buffer; shaders `atomicOr` a bit when `id >= capacity` (candidate / visible / SW-raster / BVH queue) and **skip the write**. Read back asynchronously (`gpu_readback`, ≥1–2 frames latency) into a `MeshletStats` resource + diagnostics (also publishes `candidate_high_water`).
 2. **Degrade**: a per-view `error_scale` uniform multiplies the LOD error threshold. On overflow the CPU raises `error_scale` (e.g. ×1.25 per flagged frame, decays ×0.98 per clean frame) ⇒ fewer clusters next frame. Quality ↓, no missing geometry.

@@ -96,7 +96,22 @@ Interleaved 4-run comparison, current binary (mean frame ms; min–max across ru
 ## 8. Capability fallback verified — **[Bench]**
 `forest_benchmark --meshlet --disable-int64-atomics` (disables `TEXTURE_INT64_ATOMIC` at device creation): before the change the process exited; now it logs `MeshletPlugin disabled: GPU lacks support for required features…`, keeps rendering (ground only, ~3 ms frames, exit code 0), and the supported path is unaffected. Root cause of a first-attempt panic: the *prepass* plugin registered its own meshlet system gated only on `InstanceManager`, now gated on `meshlet_supported`.
 
-## 9. Reproduce
+## 9. Queue overflow detection and graceful degradation — **[Bench]**
+
+Implemented in `bevy_pbr::meshlet::pressure` (design in `gpu_culling.md`): GPU-side 4-byte copies of the per-BVH-level node counts and the early+late candidate-cluster counters (first pass) into a probe buffer → 3-slot staging ring → asynchronous `map_async` readback (1–2 frames latency, never stalls) → `MeshletPressure::observe(peak)` → `lod_error_scale` fed into the cull shaders for **all** views. Policy: overflow ×1.25; >90 % capacity ×1.05; <60 % for 120 observations ×0.98 (floor 1.0; cap 16). Pure controller unit-tested (5 tests incl. a convergence model).
+
+| Test (11 952 opaque trees, 280 M tris) | Result |
+|---|---|
+| Normal (4 194 304 slots) | peak **61–68 k entries** (1.6 % of capacity), scale 1.0, 0 overflows. **The benchmark's previous 4 M-slot queue was ~60× oversized**; 96 k slots would have been ample here |
+| Forced overflow, 32 768 slots, **degrade on** | detected on frame 1 (peak 61 672 > 32 768); scale 1.25 → 1.95 within 3 events; peak falls to ~11.6 k; later relaxes to 1.70 with peak 22–24 k (68–74 %); **3 overflow events in 400 frames**, 1 warning, mean frame 21.2 ms |
+| Forced overflow, **degrade off** | overflow every frame (403 events), geometry dropped (visibly sparser far field in the screenshot comparison), 4 warnings (rate-limited; was 397 before the fix), mean frame 20.9 ms — *faster only because geometry is missing* |
+| Probe cost, interleaved 4+4 runs, normal config | **off 24.56 ms vs on 24.61 ms (+0.05 ms, +0.2 %)** |
+
+Quality cost of degrading is real: the scale applies to the main view too, so near-camera branch detail visibly thins (screenshot at scale ≈1.7–1.95) — the trade for never dropping clusters. A smarter policy (apply to far clusters only, or per view class) is a follow-up.
+**Limits**: second-pass BVH levels are not sampled (their counters are cumulative, not cleared per level) — the first-pass early+late pair already includes the late entries; BVH-level queue occupancy is sampled only in the first pass; with several cameras only the first raster-node invocation per frame is probed.
+**Measurement lesson (again)**: a first non-interleaved run suggested the probe cost +2 ms (27.07 vs 24.98); the interleaved A/B showed +0.05 ms — the difference was machine drift. Only interleaved comparisons are trusted in this document.
+
+## 10. Reproduce
 
 ```bash
 cargo run --release -p forest_benchmark --features meshlet -- --meshlet --meshlet-tris 64 --no-shadows --label t64
@@ -105,5 +120,6 @@ cargo test -p bevy_pbr --features meshlet_processor --lib meshlet
 cargo run --release -p forest_benchmark --features meshlet -- --meshlet --shadow-lod-scale 2 --top-spans 40
 cargo run --release -p forest_benchmark --features meshlet -- --meshlet --rebuild-shadow-hzb   # old behaviour
 cargo run --release -p forest_benchmark --features meshlet -- --meshlet --disable-int64-atomics # fallback test
+RUST_LOG=bevy_pbr::meshlet=debug cargo run --release -p forest_benchmark --features meshlet -- --meshlet --cluster-slots 32768   # forced overflow; add --no-degrade / --no-pressure-probe to compare
 ```
 Raw logs of this session were kept in the scratchpad (not committed); numbers above are copied from them.
