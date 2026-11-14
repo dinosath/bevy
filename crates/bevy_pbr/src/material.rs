@@ -750,19 +750,81 @@ fn mark_meshes_as_changed_if_their_materials_changed<M>(
 
 /// Fills the [`RenderMaterialInstances`] resources from the meshes in the
 /// scene.
+#[cfg(feature = "meshlet")]
+type IsMeshletQuery = Has<meshlet::MeshletMesh3d>;
+#[cfg(not(feature = "meshlet"))]
+type IsMeshletQuery = ();
+
 fn extract_mesh_materials<M: Material>(
     mut material_instances: ResMut<RenderMaterialInstances>,
     changed_meshes_query: Extract<
         Query<
-            (Entity, &ViewVisibility, &MeshMaterial3d<M>),
+            (Entity, &ViewVisibility, &MeshMaterial3d<M>, IsMeshletQuery),
             Or<(Changed<ViewVisibility>, Changed<MeshMaterial3d<M>>)>,
         >,
+    >,
+    #[cfg(feature = "meshlet")] mut meshlet_dirty: Option<ResMut<meshlet::MeshletMaterialDirty>>,
+    #[cfg(feature = "meshlet")] meshlet_settings: Extract<Option<Res<meshlet::MeshletSettings>>>,
+    #[cfg(feature = "meshlet")] all_meshlets_query: Extract<
+        Query<(Entity, &MeshMaterial3d<M>), With<meshlet::MeshletMesh3d>>,
     >,
 ) {
     let last_change_tick = material_instances.current_change_tick;
 
-    for (entity, view_visibility, material) in &changed_meshes_query {
-        if view_visibility.get() {
+    // Meshlet instances are culled on the GPU. In retained mode their material registration must
+    // not depend on CPU visibility (which flips as the camera moves), so register them always.
+    // In the original rebuild mode keep the old rule: registering invisible instances would only
+    // make the per-frame material scans longer.
+    #[cfg(feature = "meshlet")]
+    let retained_meshlets = meshlet_settings
+        .as_ref()
+        .is_some_and(|s| s.retained_instances);
+
+    // When the mode is switched on at runtime, entities that did not change would never be
+    // visited by the filtered query below: register all meshlet entities once.
+    #[cfg(feature = "meshlet")]
+    if retained_meshlets
+        && meshlet_settings
+            .as_ref()
+            .is_some_and(DetectChanges::is_changed)
+    {
+        for (entity, material) in &all_meshlets_query {
+            material_instances.instances.insert(
+                entity.into(),
+                RenderMaterialInstance {
+                    asset_id: material.id().untyped(),
+                    last_change_tick,
+                },
+            );
+            if let Some(dirty) = meshlet_dirty.as_mut()
+                && dirty.0.len() < 1 << 20
+            {
+                dirty.0.push(entity.into());
+            }
+        }
+    }
+
+    for (entity, view_visibility, material, is_meshlet) in &changed_meshes_query {
+        // Meshlet instances are culled on the GPU: their material registration must not depend
+        // on CPU visibility (which flips as the camera moves). Everything else keeps the old rule.
+        #[cfg(feature = "meshlet")]
+        let always_register = is_meshlet && retained_meshlets;
+        #[cfg(not(feature = "meshlet"))]
+        let always_register = {
+            let () = is_meshlet;
+            false
+        };
+
+        #[cfg(feature = "meshlet")]
+        if is_meshlet
+            && let Some(dirty) = meshlet_dirty.as_mut()
+            // Bounded: nothing drains this list if the meshlet systems are disabled.
+            && dirty.0.len() < 1 << 20
+        {
+            dirty.0.push(entity.into());
+        }
+
+        if view_visibility.get() || always_register {
             material_instances.instances.insert(
                 entity.into(),
                 RenderMaterialInstance {
@@ -795,12 +857,20 @@ fn extract_mesh_materials<M: Material>(
 fn early_sweep_material_instances<M>(
     mut material_instances: ResMut<RenderMaterialInstances>,
     mut removed_materials_query: Extract<RemovedComponents<MeshMaterial3d<M>>>,
+    #[cfg(feature = "meshlet")] mut meshlet_dirty: Option<ResMut<meshlet::MeshletMaterialDirty>>,
 ) where
     M: Material,
 {
     let last_change_tick = material_instances.current_change_tick;
 
     for entity in removed_materials_query.read() {
+        // Retained meshlet rows must notice that their material went away.
+        #[cfg(feature = "meshlet")]
+        if let Some(dirty) = meshlet_dirty.as_mut()
+            && dirty.0.len() < 1 << 20
+        {
+            dirty.0.push(entity.into());
+        }
         if let Entry::Occupied(occupied_entry) = material_instances.instances.entry(entity.into()) {
             // Only sweep the entry if it wasn't updated this frame.
             if occupied_entry.get().last_change_tick != last_change_tick {

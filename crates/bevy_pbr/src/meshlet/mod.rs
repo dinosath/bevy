@@ -12,10 +12,11 @@ mod persistent_buffer_impls;
 mod pipelines;
 mod pressure;
 mod resource_manager;
+mod retained;
 mod visibility_buffer_raster_node;
 
 pub(crate) use self::{
-    instance_manager::{queue_material_meshlet_meshes, InstanceManager},
+    instance_manager::{queue_material_meshlet_meshes, InstanceManager, MeshletMaterialDirty},
     material_pipeline_prepare::{
         prepare_material_meshlet_meshes_main_opaque_pass, prepare_material_meshlet_meshes_prepass,
     },
@@ -121,6 +122,16 @@ pub struct MeshletSettings {
     /// Measure cull-queue occupancy (GPU counter copies + asynchronous readback). Defaults to
     /// `true`. Disabling also disables `degrade_on_queue_pressure`.
     pub detect_queue_pressure: bool,
+    /// Keep the GPU instance table across frames and only touch/upload instances that changed
+    /// (spawned, despawned, moved, re-layered, new asset or material), instead of rebuilding and
+    /// re-uploading every instance every frame. Removes the dominant CPU cost of large meshlet
+    /// scenes. Defaults to `false` until validated on your content; see
+    /// `docs/performance.md` §12 for measurements.
+    pub retained_instances: bool,
+    /// Debug: after every retained update, rebuild the expected instance table from the live
+    /// world and compare it row by row, logging an error on any mismatch. O(instances) per
+    /// frame; for tests and benchmarks.
+    pub validate_retained_instances: bool,
 }
 
 impl Default for MeshletSettings {
@@ -131,6 +142,8 @@ impl Default for MeshletSettings {
             shadow_cascade_lod_error_scale_step: 1.0,
             degrade_on_queue_pressure: true,
             detect_queue_pressure: true,
+            retained_instances: false,
+            validate_retained_instances: false,
         }
     }
 }
@@ -232,6 +245,7 @@ impl Plugin for MeshletPlugin {
 
         render_app
             .insert_resource(InstanceManager::new())
+            .init_resource::<MeshletMaterialDirty>()
             .add_systems(
                 RenderStartup,
                 (

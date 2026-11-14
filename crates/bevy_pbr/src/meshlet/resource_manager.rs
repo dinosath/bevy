@@ -533,16 +533,16 @@ pub fn prepare_meshlet_per_frame_resources(
     // TODO: Move this and the submit to a separate system and remove pub from the fields
     instance_manager
         .instance_uniforms
-        .write_buffer(&render_device, &render_queue);
+        .write(&render_device, &render_queue);
     instance_manager
         .instance_aabbs
-        .write_buffer(&render_device, &render_queue);
+        .write(&render_device, &render_queue);
     instance_manager
         .instance_material_ids
-        .write_buffer(&render_device, &render_queue);
+        .write(&render_device, &render_queue);
     instance_manager
         .instance_bvh_root_nodes
-        .write_buffer(&render_device, &render_queue);
+        .write(&render_device, &render_queue);
 
     let needed_buffer_size = 4 * instance_manager.scene_instance_count as u64;
     let second_pass_candidates = match &mut resource_manager.second_pass_candidates {
@@ -562,35 +562,45 @@ pub fn prepare_meshlet_per_frame_resources(
     for (view_entity, view, render_layers, (_, shadow_view)) in &views {
         let not_shadow_view = shadow_view.is_none();
 
-        let instance_visibility = instance_manager
-            .view_instance_visibility
-            .entry(view_entity)
-            .or_insert_with(|| {
-                let mut buffer = StorageBuffer::default();
-                buffer.set_label(Some("meshlet_view_instance_visibility"));
-                buffer
-            });
-        for (instance_index, (_, layers, not_shadow_caster)) in
-            instance_manager.instances.iter().enumerate()
-        {
-            // If either the layers don't match the view's layers or this is a shadow view
-            // and the instance is not a shadow caster, hide the instance for this view
-            if !render_layers
-                .unwrap_or(&RenderLayers::default())
-                .intersects(layers)
-                || (shadow_view.is_some() && *not_shadow_caster)
+        let instance_visibility = if instance_manager.is_retained() {
+            // Shared, incrementally maintained mask per (view layers, shadow view) signature.
+            instance_manager.retained_visibility_mask(
+                render_layers.unwrap_or(&RenderLayers::default()),
+                shadow_view.is_some(),
+                &render_device,
+                &render_queue,
+            )
+        } else {
+            let instance_visibility = instance_manager
+                .view_instance_visibility
+                .entry(view_entity)
+                .or_insert_with(|| {
+                    let mut buffer = StorageBuffer::default();
+                    buffer.set_label(Some("meshlet_view_instance_visibility"));
+                    buffer
+                });
+            for (instance_index, (_, layers, not_shadow_caster)) in
+                instance_manager.instances.iter().enumerate()
             {
-                let vec = instance_visibility.get_mut();
-                let index = instance_index / 32;
-                let bit = instance_index - index * 32;
-                if vec.len() <= index {
-                    vec.extend(iter::repeat_n(0, index - vec.len() + 1));
+                // If either the layers don't match the view's layers or this is a shadow view
+                // and the instance is not a shadow caster, hide the instance for this view
+                if !render_layers
+                    .unwrap_or(&RenderLayers::default())
+                    .intersects(layers)
+                    || (shadow_view.is_some() && *not_shadow_caster)
+                {
+                    let vec = instance_visibility.get_mut();
+                    let index = instance_index / 32;
+                    let bit = instance_index - index * 32;
+                    if vec.len() <= index {
+                        vec.extend(iter::repeat_n(0, index - vec.len() + 1));
+                    }
+                    vec[index] |= 1 << bit;
                 }
-                vec[index] |= 1 << bit;
             }
-        }
-        instance_visibility.write_buffer(&render_device, &render_queue);
-        let instance_visibility = instance_visibility.buffer().unwrap().clone();
+            instance_visibility.write_buffer(&render_device, &render_queue);
+            instance_visibility.buffer().unwrap().clone()
+        };
 
         // TODO: Remove this once wgpu allows render passes with no attachments
         let dummy_render_target = texture_cache.get(
@@ -794,6 +804,10 @@ pub fn prepare_meshlet_per_frame_resources(
             view_size: view.viewport.zw(),
             not_shadow_view,
         });
+    }
+
+    if instance_manager.is_retained() {
+        instance_manager.finish_visibility_frame();
     }
 }
 
