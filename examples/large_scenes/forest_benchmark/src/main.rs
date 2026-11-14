@@ -135,6 +135,18 @@ struct Args {
     /// disable automatic LOD degradation on queue pressure
     #[argh(switch)]
     no_degrade: bool,
+    /// use the retained meshlet instance table (incremental updates)
+    #[argh(switch)]
+    retained: bool,
+    /// validate the retained table against a from-scratch rebuild every frame (slow)
+    #[argh(switch)]
+    validate: bool,
+    /// fraction (0..1) of meshlet trees that move every frame
+    #[argh(option, default = "0.0")]
+    dynamic_fraction: f32,
+    /// meshlet trees despawned and respawned per frame
+    #[argh(option, default = "0")]
+    churn: u32,
     /// restore the extra shadow depth-pyramid rebuild after the meshlet second pass
     #[argh(switch)]
     rebuild_shadow_hzb: bool,
@@ -225,6 +237,8 @@ fn main() {
             shadow_cascade_lod_error_scale_step: args.cascade_step,
             degrade_on_queue_pressure: !args.no_degrade,
             detect_queue_pressure: !args.no_pressure_probe,
+            retained_instances: args.retained,
+            validate_retained_instances: args.validate,
         });
     }
     app.insert_resource(bevy::light::DirectionalLightShadowMap {
@@ -241,7 +255,10 @@ fn main() {
             started: None,
         })
         .add_systems(Startup, setup)
-        .add_systems(Update, (move_camera, record).chain())
+        .add_systems(
+            Update,
+            (animate_dynamic, churn_trees, move_camera, record).chain(),
+        )
         .run();
 }
 
@@ -776,26 +793,58 @@ fn spawn_wood(
             std_handles.push(meshes.add(mesh));
         }
     }
-    for &(p, yaw, scale, s) in instances {
+    let mut churn_entities: Vec<Entity> = Vec::new();
+    for (i, &(p, yaw, scale, s)) in instances.iter().enumerate() {
         let tf = Transform::from_translation(p)
             .with_rotation(Quat::from_rotation_y(yaw))
             .with_scale(Vec3::splat(scale));
-        if args.meshlet {
+        // Evenly spread subset of instances that move every frame.
+        let f = args.dynamic_fraction.clamp(0.0, 1.0);
+        let dynamic = f > 0.0 && ((i as f32 + 1.0) * f).floor() > (i as f32 * f).floor();
+        let mut e = if args.meshlet {
             #[cfg(feature = "meshlet")]
-            commands.spawn((
-                bevy::pbr::experimental::meshlet::MeshletMesh3d(meshlet_handles[s].clone()),
-                MeshMaterial3d(wood_mat.clone()),
-                tf,
-            ));
+            {
+                commands.spawn((
+                    bevy::pbr::experimental::meshlet::MeshletMesh3d(meshlet_handles[s].clone()),
+                    MeshMaterial3d(wood_mat.clone()),
+                    tf,
+                ))
+            }
+            #[cfg(not(feature = "meshlet"))]
+            {
+                unreachable!("--meshlet requires the meshlet feature")
+            }
         } else {
             commands.spawn((
                 Mesh3d(std_handles[s].clone()),
                 MeshMaterial3d(wood_mat.clone()),
                 tf,
                 TreeLod { triangles: tris[s] },
-            ));
+            ))
+        };
+        if dynamic {
+            e.insert(Dynamic {
+                base: p,
+                phase: i as f32 * 0.37,
+            });
+        }
+        if args.churn > 0 {
+            churn_entities.push(e.id());
         }
         stats.scene_tris_lod0 += u64::from(tris[s]);
+    }
+    #[cfg(feature = "meshlet")]
+    if args.meshlet && args.churn > 0 {
+        commands.insert_resource(ChurnState {
+            entities: churn_entities,
+            meshes: meshlet_handles.clone(),
+            material: wood_mat.clone(),
+            rng: Rng(0xC4_0123),
+            half: instances
+                .iter()
+                .map(|i| i.0.x.abs().max(i.0.z.abs()))
+                .fold(0.0, f32::max),
+        });
     }
     stats.trees = instances.len();
     stats.entities = instances.len() + 3;
@@ -966,3 +1015,56 @@ fn report(args: &Args, stats: &SceneStats, rec: &Recorder) {
         );
     }
 }
+
+/// Marks a tree that moves every frame (tests incremental instance updates).
+#[derive(Component)]
+struct Dynamic {
+    base: Vec3,
+    phase: f32,
+}
+
+fn animate_dynamic(rec: Res<Recorder>, mut q: Query<(&Dynamic, &mut Transform)>) {
+    let t = rec.frame as f32;
+    for (d, mut tf) in &mut q {
+        tf.translation = d.base
+            + Vec3::new(
+                (t * 0.07 + d.phase).sin() * 1.5,
+                0.0,
+                (t * 0.05 + d.phase).cos() * 1.5,
+            );
+    }
+}
+
+#[cfg(feature = "meshlet")]
+#[derive(Resource)]
+struct ChurnState {
+    entities: Vec<Entity>,
+    meshes: Vec<Handle<bevy::pbr::experimental::meshlet::MeshletMesh>>,
+    material: Handle<StandardMaterial>,
+    rng: Rng,
+    half: f32,
+}
+
+#[cfg(feature = "meshlet")]
+fn churn_trees(args: Res<Args>, mut commands: Commands, state: Option<ResMut<ChurnState>>) {
+    let Some(mut st) = state else { return };
+    for _ in 0..args.churn {
+        let i = ((st.rng.next() * st.entities.len() as f32) as usize).min(st.entities.len() - 1);
+        commands.entity(st.entities[i]).despawn();
+        let half = st.half;
+        let p = Vec3::new(st.rng.range(-half, half), 0.0, st.rng.range(-half, half));
+        let sp = ((st.rng.next() * 3.0) as usize).min(2);
+        let tf = Transform::from_translation(p).with_scale(Vec3::splat(st.rng.range(0.8, 1.3)));
+        let e = commands
+            .spawn((
+                bevy::pbr::experimental::meshlet::MeshletMesh3d(st.meshes[sp].clone()),
+                MeshMaterial3d(st.material.clone()),
+                tf,
+            ))
+            .id();
+        st.entities[i] = e;
+    }
+}
+
+#[cfg(not(feature = "meshlet"))]
+fn churn_trees() {}
