@@ -153,7 +153,54 @@ Metric: fraction of ground pixels that are shadowed in an **aerial** frame (150 
 
 **Findings.** (1) Speed bought by coarse shadow LOD is bought with *missing shadows*: thin branches/leaves simplify away entirely (the Preserve-Area problem, `foliage.md`). (2) The earlier single-view check ("scale 4 looks near-identical", near camera) was misleading — near cascades are fine-grained; the aerial view exposes the loss. (3) In this view, **uniform scaling dominates per-cascade stepping** (1.5 uniform: −15.5 % at 84 % vs step 1.25: −13.1 % at 80 %), so the new `shadow_cascade_lod_error_scale_step` is shipped but **not recommended**; both defaults stay `1.0`. (4) The proper fix is not a scale but keeping thin geometry in coarse clusters (area-preserving simplification) or page-based shadows. Caveats: one scene, one aerial frame, one threshold; the metric counts dark ground pixels, not shadow shape fidelity.
 
-## 12. Reproduce
+## 12. Retained meshlet instance table (the "pure GPU scene" step) — **[Bench]**
+
+`MeshletSettings::retained_instances` (default **`false`**, opt-in). Instead of clearing and rebuilding the instance table from every `MeshletMesh3d` entity each frame and re-uploading four whole buffers plus one visibility bit-vector per view, the retained mode keeps rows in stable slots (swap-remove, dense), extracts only entities whose `MeshletMesh3d`/`GlobalTransform`/`PreviousGlobalTransform`/`RenderLayers`/`NotShadowCaster`/`NotShadowReceiver` changed (plus removals), uploads only dirty element ranges (`RetainedBuffer`, bitset dirty tracking, byte-identical std430 layout to `StorageBuffer<Vec<T>>`), resolves materials incrementally (refcounts, no per-frame table scans; meshlet material registration no longer depends on CPU `ViewVisibility` in this mode), and shares one incrementally-updated visibility mask per (view layers, shadow-view) signature across views. Any `AssetEvent<MeshletMesh>` forces a full resync.
+
+### Methodology (what "accurate" means here)
+* **Real before/after binary**: "head" = the committed code before this change, built from a separate git worktree with its own benchmark app; "rebuild" = the new binary with the original algorithm (`retained_instances = false`); "retained" = same binary, setting on. Same machine, release builds, window 1280×720, `AutoNoVsync`, 300 measured frames after 60 warm-up.
+* **Interleaved**: configurations run round-robin, order rotated every repetition (5–6 repetitions; 4 for the dynamic scenarios).
+* **A/A control**: a second copy of the baseline (`head_AA` / `rebuild_AA`) in every set shows the noise floor; differences within it are not claimed. Welch t is reported against the baseline.
+* **Same-scenario baselines**: dynamic scenarios compare retained against *rebuild with the same moving/churning instances*, not against a static run.
+* **Correctness oracle** (not only images): `MeshletSettings::validate_retained_instances` rebuilds the expected table from the live world every frame and compares it row by row (transforms, previous transforms, AABBs, BVH roots, layers, shadow flag, BVH depth) and, after the queue stage, every resolved material id. Passed **0 mismatches over 250–300 frames in 7 scenarios** (static, 10 % moving, 100 % moving, 200 spawn+despawn/frame, both, 100 k instances with 2 % moving + 500 churn/frame, shadows on). **Mutation test**: removing `Changed<GlobalTransform>` alone was *not* detected (legitimately: `PreviousGlobalTransform` changes at the same time, so the mutant was equivalent); removing both transform filters produced **178 055 logged mismatches**, so the validator does catch real faults.
+* **Pixel equivalence**: retained vs rebuild screenshots at frame 100 are **bit-identical** (0 differing pixels, 4 runs each) in a static scene and in a dynamic scene (20 % of trees moving + 50 respawns/frame, moving camera, shadows on). (Earlier in this project identical runs of older binaries differed in ~15 k pixels; that nondeterminism did not reproduce in these runs and its cause was not investigated.)
+* Unit tests (18 in `meshlet`): range encoding vs full encode for `u32`, the padded `MeshletAabb` and the real `MeshUniform`; a regression test for encase's non-truncating scratch (a real bug the dynamic scenario exposed as a `write_buffer` overrun); swap-remove/slot invariants; BVH-depth histogram; material refcounts; slot-bit patching.
+
+### Results (mean frame ms; GPU `meshlet_visibility_buffer_raster` span in the last column)
+Static scene, shadows off, drive path, opaque 23 k-tri trees (final binary, n = 6; 50 k from the previous round, n = 5):
+
+| Instances | head | rebuild (same binary) | **retained** | retained vs head | A/A control | raster span head → retained |
+|---:|---:|---:|---:|---:|---:|---|
+| 12 k | 5.80 | 5.70 (−1.8 %) | **4.17** | **−28.2 %** | −1.9 % | 3.49 → 3.28 |
+| 50 k | 11.11 | 11.58 (+4.2 %) | **6.19** | **−44.3 %** | +2.6 % | 5.29 → 5.00 |
+| 100 k | 18.67 | 18.72 (+0.3 %) | **8.53** | **−54.3 %** | +0.7 % | 7.46 → 6.96 |
+| 200 k | 36.09 | 34.65 (−4.0 %, n = 5) | **12.71** | **−64.8 %** | −1.7 % | 11.45 → 10.74 |
+
+Dynamic/churn at 100 k, shadows off, **retained vs rebuild with the same scenario** (previous round, n = 4; A/A within ±3.4 % and mostly < 1.5 %):
+
+| Scenario | rebuild | retained | change |
+|---|---:|---:|---:|
+| 1 % of instances move every frame | 21.56 | 9.43 | **−56.3 %** |
+| 10 % move | 20.38 | 9.01 | **−55.8 %** |
+| 50 % move | 20.59 | 17.17 | **−16.6 %** |
+| **100 % move** | 21.29 | 27.59 | **+29.6 % (regression)** |
+| 100 spawn+despawn per frame | 22.56 | 9.18 | **−59.3 %** |
+| 1000 spawn+despawn per frame | 33.02 | 14.50 | **−56.1 %** |
+
+Shadows on (3 cascades, 2048², previous round, n = 5): 12 k **−12.2 %** (24.88 → 21.84), 100 k **−12.6 %** (33.84 → 29.59) — the frame is dominated by shadow rendering (§3, §7), which this change does not touch.
+
+CPU span breakdown at 100 k (`trace_chrome`, 4 interleaved runs, ms/frame): `extract_meshlet_mesh_entities` 5.67 → **0.42**, `prepare_meshlet_per_frame_resources` 4.18 → **0.24**, `queue_material_meshlet_meshes` 1.22 → **0.08**, `prepare_material_meshlet_meshes*` 1.14 → **0.03**, `ExtractSchedule` 7.26 → **1.27**. Remaining CPU hot spot: `check_visibility_cpu_culling` 1.7 ms (unchanged; it is wasted work for meshlets).
+
+### Findings and limits
+* The result matches the pre-implementation estimate (≈ 9 ms at 100 k, ≈ 13 ms at 200 k): the scene becomes **GPU-bound** (retained 100 k = 8.5 ms vs GPU spans ≈ 8 ms).
+* **Not a win for scenes where most instances move every frame**: break-even is between 50 % and 100 % of instances changing per frame (per-row cost of the incremental path ≈ 2× the bulk rebuild). Use the default (rebuild) mode for such scenes; an adaptive switch was not implemented.
+* The GPU raster span is 5–7 % lower with retained instances. **Hypothesis (untested)**: the iGPU shares memory bandwidth with the CPU-side uploads that rebuild mode performs every frame.
+* Rebuild-mode parity needed two fixes found by tracing: (1) taking `&mut ResMut` for the asset resources per instance marked them changed on every instance; (2) the asset-cache lookup as a non-inlined function cost 0.9 ms per 100 k instances (inlining restored parity: the loop measured 6.96 → 6.07 ms vs the original 5.67 ms in an in-process timing harness; end-to-end the A/A-bounded difference is within noise). A residual of ≈ +0.4 ms per 100 k remains in that in-process measure.
+* One 200 k run (twice across rounds) ended with "No windows are open, exiting" before printing a row — a window-system flake, not a panic; those cells report n = 5.
+* Material ids are now stable across frames in retained mode and must stay ≤ 65 535 (the shade pass draws `material_id × 3`); asset reload, new materials or toggling the setting at runtime trigger a resync (the generic material extractor re-registers all meshlet entities on the frame the setting changes).
+* Not measured: GPU-written transforms, instances without ECS entities (stage 3 of the plan), page-granular residency.
+
+## 13. Reproduce
 
 ```bash
 cargo run --release -p forest_benchmark --features meshlet -- --meshlet --meshlet-tris 64 --no-shadows --label t64
@@ -162,6 +209,10 @@ cargo test -p bevy_pbr --features meshlet_processor --lib meshlet
 cargo run --release -p forest_benchmark --features meshlet -- --meshlet --shadow-lod-scale 1.5 --top-spans 40
 cargo run --release -p forest_benchmark --features meshlet -- --meshlet --path aerial --shadow-lod-scale 1.5 --screenshot-frame 60 --screenshot-path a.png   # then tools/shadow_coverage.py
 cargo run --release -p forest_benchmark --features meshlet,trace -- --meshlet --no-shadows --trees 100000   # trace-*.json, summarize with tools/trace_summary.py
+# retained instance table: scenarios and the correctness oracle
+cargo run --release -p forest_benchmark --features meshlet -- --meshlet --retained --validate --dynamic-fraction 0.1 --churn 200
+# interleaved A/B with A/A control (see the docstring of tools/ab_bench.py)
+python3 examples/large_scenes/forest_benchmark/tools/ab_bench.py --reps 5 --common "--meshlet --no-shadows --trees 100000 --frames 300" --config rebuild=./forest --config retained=./forest:--retained --config rebuild_AA=./forest
 cargo run --release -p forest_benchmark --features meshlet -- --meshlet --rebuild-shadow-hzb   # old behaviour
 cargo run --release -p forest_benchmark --features meshlet -- --meshlet --disable-int64-atomics # fallback test
 RUST_LOG=bevy_pbr::meshlet=debug cargo run --release -p forest_benchmark --features meshlet -- --meshlet --cluster-slots 32768   # forced overflow; add --no-degrade / --no-pressure-probe to compare

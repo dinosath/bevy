@@ -18,3 +18,9 @@ scaled down use coarser ones. Unscaled instances are unaffected.
 Shadow views no longer rebuild their depth pyramid a second time after the second culling pass by
 default. Set `MeshletSettings::rebuild_shadow_depth_pyramid_after_second_pass = true` to restore the
 previous behavior.
+
+`InstanceManager`'s per-instance buffers are now `RetainedBuffer<T>` (same GPU layout, `binding()`
+unchanged) instead of `StorageBuffer<Vec<T>>`. With `MeshletSettings::retained_instances = true`,
+meshlet entities' material registration in `RenderMaterialInstances` no longer depends on their
+`ViewVisibility` (they are culled on the GPU), and `MeshletMaterialDirty` is populated by
+`extract_mesh_materials`.
